@@ -1,0 +1,2600 @@
+//! App settings, saved with the download list (store.rs). Defaults are IDM 6.42's
+//! (notes/ui-spec/options-dialog.md, scheduler-and-misc.md).
+
+use mdm_ipc::capture::host_matches;
+use serde::{Deserialize, Serialize};
+
+/// View → Window system's choice (Linux, #624), as saved in the settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowSystemPick {
+    /// X11's windows: XWayland's in a Wayland session.
+    X11,
+    /// Wayland's own windows.
+    Wayland,
+}
+
+/// Options → Proxy / Socks → Manual → Type (#1558): what the proxy speaks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyKind {
+    /// An HTTP proxy (`http://`): web addresses only, for the ticked schemes.
+    #[default]
+    Http,
+    /// An HTTP proxy reached over TLS (`https://`).
+    Https,
+    /// SOCKS5 (`socks5://`, `socks5h://` with the names looked up through it), with a login.
+    Socks5,
+    /// SOCKS4 (`socks4://`, `socks4a://` with the names looked up through it), no login.
+    Socks4,
+}
+
+impl ProxyKind {
+    /// In Type's order.
+    pub const ALL: [ProxyKind; 4] = [
+        ProxyKind::Http,
+        ProxyKind::Https,
+        ProxyKind::Socks5,
+        ProxyKind::Socks4,
+    ];
+
+    /// Its name in Type (a protocol's name: the same in every language).
+    pub fn label(self) -> &'static str {
+        match self {
+            ProxyKind::Http => "HTTP",
+            ProxyKind::Https => "HTTPS",
+            ProxyKind::Socks5 => "SOCKS5",
+            ProxyKind::Socks4 => "SOCKS4",
+        }
+    }
+
+    /// A SOCKS proxy carries every connection (web, FTP, torrents), not only web addresses.
+    pub fn is_socks(self) -> bool {
+        matches!(self, ProxyKind::Socks5 | ProxyKind::Socks4)
+    }
+
+    /// Whether it takes a user name and password (SOCKS4 has none).
+    pub fn has_login(self) -> bool {
+        self != ProxyKind::Socks4
+    }
+
+    /// The address's scheme; `remote_dns`: the proxy looks the site's name up (socks5h,
+    /// socks4a), so this computer's DNS never sees it.
+    pub fn scheme(self, remote_dns: bool) -> &'static str {
+        match (self, remote_dns) {
+            (ProxyKind::Http, _) => "http",
+            (ProxyKind::Https, _) => "https",
+            (ProxyKind::Socks5, true) => "socks5h",
+            (ProxyKind::Socks5, false) => "socks5",
+            (ProxyKind::Socks4, true) => "socks4a",
+            (ProxyKind::Socks4, false) => "socks4",
+        }
+    }
+
+    /// The kind (and whether names go through it) an address's scheme names: `socks5://host`,
+    /// typed before Type existed, reads as SOCKS5 with the names looked up here, as it worked
+    /// then. None: a scheme that isn't a proxy's.
+    pub fn from_scheme(scheme: &str) -> Option<(ProxyKind, bool)> {
+        Some(match scheme.to_ascii_lowercase().as_str() {
+            "http" => (ProxyKind::Http, true),
+            "https" => (ProxyKind::Https, true),
+            "socks5h" => (ProxyKind::Socks5, true),
+            "socks5" | "socks" => (ProxyKind::Socks5, false),
+            "socks4a" => (ProxyKind::Socks4, true),
+            "socks4" => (ProxyKind::Socks4, false),
+            _ => return None,
+        })
+    }
+}
+
+/// What Get System fills Manual with (#1558): the type, address, port and the http / https
+/// boxes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct SystemProxy {
+    pub kind: ProxyKind,
+    pub host: String,
+    pub port: String,
+    pub http: bool,
+    pub https: bool,
+}
+
+/// Windows' `ProxyServer` value (`host:port`, or `http=host:port;https=…;socks=…`) as Get System
+/// reads it: the HTTP proxy when there is one (a lone `host:port` serves every scheme), else the
+/// SOCKS one. Windows doesn't say which SOCKS version its `socks=` speaks: SOCKS5 is taken (what
+/// Tor, `ssh -D` and proxy programs speak); Type can say SOCKS4.
+// Get System reads Windows' settings only (options.rs); the parser is tested on every system.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_system_proxy(server: &str) -> Option<SystemProxy> {
+    let entries: Vec<&str> = server
+        .split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+    let named = |key: &str| {
+        entries.iter().find_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            k.trim().eq_ignore_ascii_case(key).then(|| v.trim())
+        })
+    };
+    let split = |at: &str| -> Option<(String, String)> {
+        // `http://host:port` is read too (some programs write the scheme).
+        let at = at.split_once("://").map_or(at, |(_, rest)| rest);
+        let (host, port) = at.trim_end_matches('/').rsplit_once(':')?;
+        Some((host.to_owned(), port.to_owned()))
+    };
+    let http_proxy = |host, port, http, https| SystemProxy {
+        kind: ProxyKind::Http,
+        host,
+        port,
+        http,
+        https,
+    };
+    if let Some(plain) = entries.iter().find(|e| !e.contains('=')) {
+        let (host, port) = split(plain)?;
+        return Some(http_proxy(host, port, true, true));
+    }
+    let (http, https) = (named("http"), named("https"));
+    if let Some(at) = http.or(https) {
+        let (host, port) = split(at)?;
+        // Only the schemes whose proxy is this one are ticked.
+        let same = |o: Option<&str>| o.is_some_and(|o| split(o) == split(at));
+        return Some(http_proxy(host, port, same(http), same(https)));
+    }
+    let (host, port) = split(named("socks")?)?;
+    Some(SystemProxy {
+        kind: ProxyKind::Socks5,
+        host,
+        port,
+        http: true,
+        https: true,
+    })
+}
+
+/// A debrid service account (#44), as Options → Accounts keeps it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebridAccount {
+    /// Stable, for the order and for errors that name the account.
+    pub id: u64,
+    pub service: mdm_debrid::ServiceKind,
+    pub enabled: bool,
+    /// The account's name at the service, and its state as last read ("premium, 143 days").
+    pub user: String,
+    pub state: String,
+    /// The credential's JSON (`mdm_debrid::Credential`); on disk its keychain reference, or sealed
+    /// (`sealed`, secrets.rs). Never shown, logged or sent anywhere but the service.
+    #[serde(with = "sealed")]
+    pub secret: String,
+}
+
+impl Default for DebridAccount {
+    fn default() -> Self {
+        DebridAccount {
+            id: 0,
+            service: Default::default(),
+            enabled: true,
+            user: String::new(),
+            state: String::new(),
+            secret: String::new(),
+        }
+    }
+}
+
+/// Never the secret, even in a debug dump.
+impl std::fmt::Debug for DebridAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DebridAccount")
+            .field("id", &self.id)
+            .field("service", &self.service)
+            .field("user", &self.user)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DebridAccount {
+    /// For `mdm_debrid`: None when its secret can't be read (signed out, or sealed for another
+    /// Windows account).
+    pub fn account(&self) -> Option<mdm_debrid::Account> {
+        let credential = serde_json::from_str(&self.secret).ok()?;
+        Some(mdm_debrid::Account {
+            id: self.id,
+            service: self.service,
+            credential,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Downloads → Speed Limiter → Turn on / Turn off.
+    pub speed_limit_on: bool,
+    /// "Maximum download speed for one file", KBytes/sec (IDM default 10).
+    pub speed_limit_kb: u64,
+    /// "Always turn on Speed Limiter on … startup".
+    pub limiter_on_startup: bool,
+    /// Beyond IDM (D-012): one limit for all downloads together, optionally only while the
+    /// user is at the computer. Off by default.
+    pub global_limit_on: bool,
+    pub global_limit_kb: u64,
+    pub global_only_active: bool,
+    /// Options → Connection → "Default max. conn. number" (IDM default 8).
+    pub max_connections: u32,
+    /// Beyond IDM (issue #12): "Allow more than 32 connections" raises the ceiling of that
+    /// number and of the exceptions from `MAX_CONNECTIONS` to `MAX_CONNECTIONS_UNLOCKED`.
+    pub many_connections: bool,
+    /// Show the "Download complete" dialog (Options → Downloads).
+    pub show_complete: bool,
+    /// Download complete snoozed until then (unix seconds; its window's Snooze menu, #741):
+    /// `show_complete` stays as it is. A snooze until MDM restarts is not saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete_snoozed_until: Option<i64>,
+    /// Options → Downloads: "Don't show pop-ups while a full-screen app or presentation is
+    /// running" (#1773, hold.rs): Download complete and MDM's other windows that come up by
+    /// themselves wait while a full-screen game, app or video, a presentation or the locked
+    /// screen is on, and show when the user is back. On by default, for lists saved before it
+    /// too.
+    pub hold_popups: bool,
+    /// List right-click → On Double click: Open (true) or Properties (IDM default).
+    pub double_click_open: bool,
+    /// Ask before deleting downloads ("Don't show this dialog again" clears it). Off, Delete only
+    /// takes downloads off the list: deleting files from the disk always asks (#1563).
+    ///
+    /// Its "Also delete the files from disk" is never remembered: it starts unticked, or ticked
+    /// for one Shift+Delete. Lists before #1563 saved the last answer as `delete_files_too`,
+    /// which made every later delete (and, with this off, one never asked) take the finished
+    /// files too; that key is no longer read, and goes with the next save.
+    pub confirm_delete: bool,
+    /// Categories pane frame width (IDM: 143, frame x 6..149); dragged with the splitter.
+    pub categories_width: u32,
+    /// The main window as last left: position and size (x, y, width, height, in points at 100 %
+    /// interface size: the system's own logical pixels), and maximized.
+    pub window: Option<[i32; 4]>,
+    pub window_maximized: bool,
+    /// The Categories pane shown, its branches open (All, Unfinished, Finished, Queues),
+    /// and the node last shown.
+    pub show_categories: bool,
+    pub branches: [bool; 4],
+    /// The preview pane beside the list (#1368, View → Preview pane, Alt+P): the selected
+    /// download's picture and details. Off unless shown.
+    pub preview_pane: bool,
+    /// Its frame's width, dragged with its splitter.
+    pub preview_width: u32,
+    pub view: Option<crate::app::View>,
+    /// View → Dark Mode support (IDM 6.37): follow Windows' dark app mode; off = always light.
+    pub dark_mode_support: bool,
+    /// View → Always dark (#60): dark whatever the system says (a desktop that reports no
+    /// preference, or a dark MDM on a light desktop).
+    pub always_dark: bool,
+    /// The look (#45): a built-in theme's id ("classic", the default) or a theme file's name in
+    /// the data folder's `themes` folder (crate::themefile).
+    pub theme: String,
+    /// View → Draw with (#89): OpenGL or Direct3D (Windows only), used from the next start.
+    /// None: MDM's default (`renderer::DEFAULT`), which may change.
+    pub renderer: Option<crate::renderer::Api>,
+    /// View → Window system (Linux, in a Wayland session that also runs XWayland, #624): X11
+    /// (XWayland) or Wayland, used from the next start, however MDM is started (its menu entry,
+    /// the browser's helper, the session's autostart). None: MDM decides at each start
+    /// (`unix::window_system`). `MDM_WAYLAND=1` or `0` overrides it for one start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_system: Option<WindowSystemPick>,
+    /// View → Interface size (#262), percent: one of `crate::scale::STEPS` (100 to 200). Every
+    /// window drawn that much larger than the display's own scale makes it.
+    pub interface_size: u16,
+    /// View → Font (#1489): the font file the interface's text is drawn in (a path to a
+    /// TrueType or OpenType file), or none for the computer's own font (Segoe UI on Windows).
+    /// It changes the letters only: View → Interface size still sizes every window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_font: Option<std::path::PathBuf>,
+    /// View → Font (#1489), percent: one of `crate::theme::TEXT_SIZES`. The interface's
+    /// text drawn that much larger or smaller than the theme's sizes; the layout keeps its own
+    /// (View → Interface size zooms all of it).
+    pub interface_text_size: u16,
+    /// View → Text (Windows): smooth text as Windows' modern apps draw it, or the classic
+    /// controls' hinted, whole-pixel look, the default (`crate::theme::set_smooth_text`): text
+    /// doesn't change look on an update; a dense screen can choose Smooth.
+    pub smooth_text: bool,
+    /// Scheduler → Download limits: "Download no more than `limits_mb` MBytes every
+    /// `limits_hours` hours" (IDM defaults 200 / 5), with a warning before stopping.
+    pub limits_on: bool,
+    pub limits_mb: u32,
+    pub limits_hours: u32,
+    pub limits_warn: bool,
+
+    // ---- Options (notes/ui-spec/options-dialog.md; IDM 6.42 defaults unless noted) ----
+    /// General: start with Windows. IDM's default is on; ours is off until the user asks
+    /// (a download manager shouldn't register itself silently).
+    pub launch_on_startup: bool,
+    /// View → Language: a catalog's code (`ar`, `pt-br`…); `None` follows Windows.
+    pub language: Option<String>,
+    /// The language has been chosen once (in the installer's wizard or the first start's
+    /// picker); until then the first start asks (langpick.rs).
+    pub language_asked: bool,
+    /// The video helpers (yt-dlp, ffmpeg) have been offered once, at a start (helpers.rs).
+    pub helpers_asked: bool,
+    /// The browser extension is offered at each start until a browser has it, unless "Don't ask
+    /// again" was pressed (extension.rs).
+    pub extension_never_ask: bool,
+    /// General: offer to download (Download File Info) links of the listed file types copied
+    /// to the clipboard. On by default: without the browser extension, copying a link is the
+    /// quickest way in.
+    pub clipboard_autostart: bool,
+    /// General: Minimize hides the main window, and a download's progress window, to the
+    /// notification area, as closing the main window does (#63). On by default (the
+    /// maintainer's choice), for existing lists too. Only where a tray shows MDM's icon.
+    pub minimize_to_tray: bool,
+    /// General: closing the main window keeps MDM running, hidden in the notification area (else
+    /// closing quits). On by default, for existing lists too, in every copy. Only where a tray
+    /// shows MDM's icon.
+    pub close_to_tray: bool,
+    /// General: "Show downloads when the notification area icon is clicked" (#1365): a click on
+    /// the icon shows the downloads panel (traypanel.rs), a double click the window; unticked,
+    /// the click shows the window again or hides it there, as before. Ticked for a new list; a
+    /// list saved before it reads unticked (the field's own default), so nobody's click changes
+    /// under them. Only where a tray shows MDM's icon.
+    #[serde(default)]
+    pub tray_panel: bool,
+    /// General: a private (incognito) window's downloads are written to the saved list like any
+    /// other, so they survive MDM closing or restarting (their cookies stay in memory, as every
+    /// download's do); unticked, they live in memory only, as the browser keeps them. On by
+    /// default (#1581: a finished download that left the list a day later looked lost). Saved
+    /// as `keep_private_list`: the lists before #1581 saved `keep_private_downloads: false`,
+    /// the default then, unticked and never looked at alike, so a list that has no
+    /// `keep_private_list` (every list before it) gets the new default, and a choice made from
+    /// then on is kept.
+    #[serde(rename = "keep_private_list")]
+    pub keep_private_downloads: bool,
+    /// The first private-window download has come (#1581): the notice that says they are kept,
+    /// and where to turn that off, was shown, once (`App::private_added`).
+    pub private_notice_shown: bool,
+    /// General (#558): global keyboard shortcut to show or hide the main window (e.g. `Cmd+U`,
+    /// `Shift+Cmd+M`, `Ctrl+Alt+D`); empty when none is set.
+    #[serde(default)]
+    pub show_hide_hotkey: String,
+    pub mv2_extensions: bool,
+    pub advanced_integration: bool,
+    /// General: "Capture downloads from the following browsers" (name, on).
+    pub browsers: Vec<(String, bool)>,
+    /// File types: extensions taken over automatically (space separated).
+    pub auto_types: String,
+    /// File types: sites (space separated) and addresses never taken over.
+    pub excluded_sites: String,
+    pub excluded_addresses: Vec<String>,
+    /// General → Download panels: the download button over videos in the browsers, and the
+    /// sites it stays off (space separated; the native host reads both, mdm_ipc::capture).
+    pub video_panel: bool,
+    pub video_panel_sites: String,
+    /// General → Download panels → Button size (#1278): Compact shows the button as its round
+    /// form (the logo, the arrow, the ✕) over every video. The host reads it too.
+    pub video_panel_compact: bool,
+    /// The same, Full: its words wherever they fit, the round form only on a small video (as
+    /// before Automatic). Neither (the default, and what settings saved before it say):
+    /// Automatic, the round form in a feed and over a small player, the words over a big one.
+    pub video_panel_full: bool,
+    /// General → Download panels → Button size (#1923), percent: one of
+    /// `mdm_ipc::capture::VIDEO_PANEL_SCALES` (80, 100 or 120). The host reads it too.
+    pub video_panel_scale: u16,
+    /// General: also take the listed types the browser would open itself (a PDF in its viewer,
+    /// an MP3 in its player); holding Alt while clicking leaves one to the browser.
+    pub capture_opened: bool,
+    /// File types: files smaller than this (KB) stay with the browser; 0 takes any size.
+    pub capture_min_kb: u64,
+    /// Options → Regional: how dates and times are written.
+    pub regional: crate::regional::Regional,
+    /// Save to: a folder per category (category label → folder); missing = the default.
+    pub category_dirs: Vec<(String, String)>,
+    pub change_folder_on_last: bool,
+    /// Save to → "Save every download in General's folder" (#1973): new downloads of every
+    /// category go to General's folder ([`Settings::save_dir`]); the categories still sort the
+    /// list. Off by default, and in settings saved before it.
+    pub one_folder: bool,
+    /// The addresses typed into Add URL and the folders downloads were saved to, newest first
+    /// (the Address and Save As drop lists, as IDM's UrlHistory.txt).
+    pub url_history: Vec<String>,
+    pub folder_history: Vec<String>,
+    pub set_creation_date: bool,
+    /// Downloads → "Mark downloaded files as coming from the internet" (#813): Windows' Mark of
+    /// the Web, macOS' quarantine, Linux's origin attributes (`webmark`).
+    pub mark_downloads: bool,
+    /// Downloads.
+    pub show_start_dialog: bool,
+    /// Downloads → Customize "Download progress" dialog → Edit... (#1041): a download's
+    /// progress window opens when it starts. Off, it runs in the list (double-click opens it).
+    pub show_progress: bool,
+    pub only_add_to_queue: bool,
+    pub start_immediately: bool,
+    pub queue_panel_later: bool,
+    pub queue_panel_batch: bool,
+    pub ignore_mtime: bool,
+    /// "If a duplicate download link is added": 0 ask, 1 numbered name, 2 overwrite,
+    /// 3 complete → show the complete dialog, else resume.
+    pub duplicate_action: u8,
+    /// "User-Agent for manually added downloads": the user's, or empty for the automatic one
+    /// (the default browser's, #668: `mdm_engine::agent::automatic`). Saved before #668 as
+    /// Internet Explorer 11's, the default then: read as empty (`own_user_agent`), which an older
+    /// MDM reads as its default again.
+    #[serde(deserialize_with = "automatic_agent")]
+    pub user_agent: String,
+    /// Connection: per-server connection limits (server, number), in their order: the first
+    /// that names a download's server gives its number (`mdm_ipc::siterules::for_url`). A site
+    /// rule's number of connections is the exception under its pattern.
+    pub conn_exceptions: Vec<(String, u32)>,
+    /// Connection → Site rules (#1778): a User-Agent, the browser-like connection and request
+    /// headers by site pattern, the first rule that matches and sets each giving it. Their
+    /// numbers of connections are in `conn_exceptions`, which older versions read.
+    pub site_rules: Vec<mdm_ipc::siterules::SiteRule>,
+    /// Proxy / Socks: 0 none, 1 system, 2 automatic script, 3 manual.
+    pub proxy_from_browser: bool,
+    pub proxy_mode: u8,
+    pub proxy_script: String,
+    pub proxy_host: String,
+    pub proxy_port: String,
+    pub proxy_user: String,
+    /// Sealed on disk like Sites Logins' passwords (`sealed`); a plain one from before still reads.
+    #[serde(with = "sealed")]
+    pub proxy_pass: String,
+    /// Options → Archives → Archive passwords (#37): tried in this order on an encrypted archive
+    /// before its password is asked, one a line. Kept in the keychain as the other passwords.
+    #[serde(with = "sealed")]
+    pub archive_passwords: String,
+    pub proxy_http: bool,
+    pub proxy_https: bool,
+    pub proxy_ftp: bool,
+    /// Manual → Type (#1558). An address typed with its scheme (`socks5://host`, before Type
+    /// existed) says it instead ([`Settings::manual_proxy`]).
+    pub proxy_kind: ProxyKind,
+    /// Manual → "Look up site names through the proxy" (SOCKS: socks5h, socks4a), on by
+    /// default: this computer's DNS never sees the sites' names.
+    pub proxy_remote_dns: bool,
+    /// Connection → DNS (#36): 0 the system's, 1 plain DNS, 2 DNS over TLS, 3 DNS over HTTPS.
+    pub dns_mode: u8,
+    /// A service of `mdm_engine::dns::PRESETS` by id, or "custom".
+    pub dns_provider: String,
+    /// Custom: the servers (plain, TLS) or the DoH server's addresses (optional), as typed.
+    pub dns_servers: String,
+    /// Custom DNS over TLS: the name the servers' certificate shows.
+    pub dns_tls_name: String,
+    /// Custom DNS over HTTPS: the address (`https://.../dns-query`).
+    pub dns_doh_url: String,
+    /// NextDNS: the configuration ID (six hex digits), or none.
+    pub dns_nextdns_id: String,
+    /// When the chosen DNS can't be reached, ask the system's (off: strict).
+    pub dns_fallback: bool,
+    /// Options → Proxy / Socks → Network adapter (#35): every connection goes through this
+    /// adapter (its name as the system shows it, or one of its addresses), or none at all; ""
+    /// lets the system choose.
+    pub net_adapter: String,
+    /// "Use FTP in PASV mode": passive data connections (the client connects; works behind
+    /// NAT), else active. Named anew when FTP arrived: `ftp_pasv` was saved as false while
+    /// the box was greyed.
+    pub ftp_passive: bool,
+    /// Sites Logins: (site/path, user, password). The passwords are written sealed for this
+    /// Windows account (`sealed_logins`).
+    #[serde(with = "sealed_logins")]
+    pub site_logins: Vec<(String, String, String)>,
+    /// Options → Accounts (#44): debrid service accounts, in the order they are asked.
+    pub debrid_accounts: Vec<DebridAccount>,
+    /// "Download supported file-host links through these accounts".
+    pub debrid_on: bool,
+    /// Options → Accounts (#44): magnet links and .torrent files go to the first account, whose
+    /// service downloads them; their files then come over HTTP. No peer connections. Off: as
+    /// before, through the torrent engine.
+    pub debrid_torrents: bool,
+    /// Sounds: download complete, download failed, queue started, queue stopped/finished.
+    pub sounds: [(bool, String); 4],
+    /// The local automation API (beyond IDM): status queries over the command channel. Off by
+    /// default; `misterdownloadmanager-cli api on` turns it on.
+    pub automation_api: bool,
+    /// Options → Remote (#141, beyond IDM): paired phones and computers on the local network
+    /// add and control downloads (crates/remote). Off by default.
+    pub remote_on: bool,
+    /// Its port.
+    pub remote_port: u16,
+    /// Where it listens: "" every local network address, `127.0.0.1` this computer only, or
+    /// one address (`mdm_remote::addrs::chosen`).
+    pub remote_listen: String,
+    /// Torrents keep sharing after they finish (D-018: off; a finished torrent stops, like any
+    /// download).
+    pub torrent_keep_sharing: bool,
+    /// Torrent settings' "Open magnet links and .torrent files with Mister Download Manager":
+    /// the system opens them with MDM (D-018: opt-in, current user), and the browser hands a
+    /// .torrent download over (#1058: off, it stays with the browser for the user's own torrent
+    /// client). None: never decided, settled once at the first start (`settle_torrent_handler`)
+    /// and saved. Saved as `torrent_handler`, which mdm_ipc::capture::CaptureRules reads (None
+    /// there: taken, as before): every list before #1058 saved `torrent_associations: false`,
+    /// unticked and never looked at alike.
+    #[serde(rename = "torrent_handler")]
+    pub torrent_associations: Option<bool>,
+    /// The switch as lists before #1058 saved it, read only: true was the user's tick; false
+    /// says nothing (`settle_torrent_handler`).
+    #[serde(rename = "torrent_associations", skip_serializing)]
+    pub torrent_associations_before: bool,
+    /// Torrent settings → Network (#40, `torrent_config`): accept incoming connections, map
+    /// the port with the router's UPnP, a fixed port (0: any, picked at each start), the DHT,
+    /// finding peers on the local network.
+    pub torrent_incoming: bool,
+    pub torrent_upnp: bool,
+    pub torrent_port: u16,
+    /// Torrent settings → "Connect over uTP too" (#1384): BitTorrent over UDP beside TCP, on by
+    /// default (a list saved before it has none: on too). It needs the listening port (librqbit's
+    /// uTP socket is the listener's), and a proxy turns it off (SOCKS5 carries TCP only).
+    pub torrent_utp: bool,
+    pub torrent_dht: bool,
+    pub torrent_lsd: bool,
+    /// Torrents go through Proxy / Socks' SOCKS5 proxy (a manual `socks5://` one only).
+    pub torrent_proxy: bool,
+    /// A blocklist's address (empty: none), fetched again every `BLOCKLIST_DAYS`.
+    pub torrent_blocklist: String,
+    /// Torrent settings → "Add the trackers of a public list to public torrents" (#1776): off
+    /// by default. Torrents added while it is on get the list's trackers as last fetched (never
+    /// a private one, BEP 27); the list is fetched again once a day (`torrents::PublicTrackers`).
+    pub torrent_public_trackers: bool,
+    /// That list's address (empty: `mdm_torrent::public_trackers::DEFAULT_LIST`).
+    pub torrent_public_trackers_url: String,
+    /// Stop the torrent engine when no torrent runs (it stops listening; new settings apply).
+    pub torrent_stop_idle: bool,
+    /// Torrent settings → "Limit uploading to [n] KBytes/sec" for all torrents together (#39;
+    /// off by default: a torrent's own limit, in its progress window, still applies).
+    pub torrent_upload_on: bool,
+    pub torrent_upload_kb: u64,
+    /// Torrent settings → seeding limits (#39), both off by default (D-018: sharing is the
+    /// user's choice): stop sharing a finished torrent at a share ratio (in hundredths: 200 is
+    /// 2.00), or after so many minutes of sharing.
+    pub torrent_stop_ratio_on: bool,
+    pub torrent_stop_ratio: u32,
+    pub torrent_stop_minutes_on: bool,
+    pub torrent_stop_minutes: u32,
+    /// Help: look for a newer release once a week (D-020; its switch is in Check for updates:
+    /// Options → General has no free row in IDM's layout).
+    pub update_check: bool,
+    /// When the weekly check last ran (Unix seconds; 0: never).
+    pub update_checked: i64,
+    /// The user's categories (D-021), after IDM's and Torrents.
+    pub custom_categories: Vec<crate::model::CustomCategory>,
+    /// The built-in categories the user renamed, gave other file types or deleted (#93); the
+    /// others are as shipped. Their folders stay in `category_dirs`.
+    pub builtin_categories: Vec<crate::model::BuiltinEdit>,
+    /// Tasks → Show drop target: shown, and where (screen, logical points).
+    pub drop_target: bool,
+    pub drop_target_pos: Option<(i32, i32)>,
+    /// Download video from a page: the subtitles last chosen (#68), offered again for the
+    /// next video when it has that language (none at first).
+    pub video_subs: mdm_tools::video::Subs,
+    /// Download video from a page → Embed chapters (#827): a video's chapters go into its file
+    /// (with ffmpeg). On; a settings file from before has none: on.
+    pub video_chapters: bool,
+    /// Download video from a page → Split into chapters: split video into multiple files based on
+    /// chapters (with ffmpeg). Off; a settings file from before has none: off.
+    pub video_split_chapters: bool,
+    /// Options → Sites Logins → Cookies for video sites (#229): the browser whose cookies
+    /// yt-dlp reads on this computer when the extension passed none (yt-dlp's name: `firefox`,
+    /// `chrome`...; empty: off, the default), and its profile (a name or a folder; empty: the
+    /// browser's last used). A settings file from before has neither: off.
+    pub video_cookies: String,
+    pub video_cookies_profile: String,
+    /// Options → Sites Logins → Use my yt-dlp config file: yt-dlp also reads its own config
+    /// file, and MDM's arguments still win over it. Off; a settings file from before has none:
+    /// off.
+    pub ytdlp_config: bool,
+    /// Options → Archives (#37): extract an archive when its download completes (a Link grabber
+    /// package says so itself). Off, as a browser leaves archives alone.
+    pub extract_auto: bool,
+    /// Then move the archive (every volume of it) to the Recycle Bin (the Trash). Off.
+    pub extract_delete: bool,
+    /// Extract in place with HatchZip when it is installed: the archive is removed while its
+    /// files come out, so only they need room (large downloads on a nearly full disk). Off.
+    pub extract_in_place: bool,
+    /// Options → Archives → Use another program... (#1525): the 7-Zip command line program
+    /// chosen for 7z and RAR archives (PeaZip's own, a portable copy); empty: the one MDM
+    /// finds (`extractq::seven_zip_for`).
+    pub seven_zip_path: String,
+    /// Into a folder named after the archive: 0 when it holds several things at its top (smart),
+    /// 1 always, 2 never.
+    pub extract_subfolder: u8,
+    /// Options → Archives (#1661): test a ZIP, 7z or RAR when its download completes (every
+    /// entry read back and checked) before it counts as done. On: a broken archive is found
+    /// then, not when someone opens it much later.
+    pub test_archives: bool,
+    /// ... up to this many GB (a test reads the whole file): a larger one is tested only with
+    /// right-click → Test archive. 4.
+    pub test_archives_gb: u32,
+    /// Link grabber: look each link up (name, size, online) when it arrives, as IDM's "Download
+    /// all links" does. On.
+    pub grabber_check: bool,
+    /// Link grabber: web pages hidden (IDM's "Hide HTML files"). On.
+    pub grabber_hide_pages: bool,
+    /// Link grabber (#1774): how many levels of subfolders an FTP folder or a web server's
+    /// listing ("Index of") given to it is read into, 0 for the folder's own files only (at most
+    /// `mdm_engine::folder::MAX_DEPTH`). 3.
+    pub grabber_depth: u8,
+    /// ... only its files of these types, written as Options → File types writes them (`ISO ZIP
+    /// R0*`); every type when empty. Empty.
+    pub grabber_types: String,
+    /// Click'n'Load (#37): a page's button posts its links to 127.0.0.1:9666, shown in Link
+    /// grabber. Off by default: any page may post there.
+    pub cnl_on: bool,
+    /// Click'n'Load: the sites asked about, each allowed (true) or blocked, by host.
+    pub cnl_sites: Vec<(String, bool)>,
+}
+
+/// Options → File types defaults (IDM 6.42), shared with the browser host (mdm_ipc::capture).
+pub use mdm_ipc::capture::{DEFAULT_AUTO_TYPES, DEFAULT_EXCLUDED_SITES};
+/// The browsers IDM 6.42 lists, plus Firefox's forks MDM tells apart (#41; capture::browser_named),
+/// all captured on.
+pub const BROWSERS: [&str; 12] = [
+    "Apple Safari",          // not translated: a product name
+    "Brave Browser",         // not translated: a product name
+    "Floorp",                // not translated: a product name
+    "Google Chrome",         // not translated: a product name
+    "Internet Explorer",     // not translated: a product name
+    "LibreWolf",             // not translated: a product name
+    "Microsoft Edge",        // not translated: a product name
+    "Microsoft Edge Legacy", // not translated: a product name
+    "Mozilla Firefox",       // not translated: a product name
+    "Opera",                 // not translated: a product name
+    "Waterfox",              // not translated: a product name
+    "Zen Browser",           // not translated: a product name
+];
+
+impl Settings {
+    /// A list saved before a browser was known gets it, captured (as an unlisted browser
+    /// already is, capture::CaptureRules::captures), so Options shows it.
+    pub fn list_known_browsers(&mut self) {
+        for b in BROWSERS {
+            if !self.browsers.iter().any(|(n, _)| n == b) {
+                self.browsers.push((b.to_owned(), true));
+            }
+        }
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            speed_limit_on: false,
+            speed_limit_kb: 10,
+            limiter_on_startup: false,
+            global_limit_on: false,
+            global_limit_kb: 500,
+            global_only_active: false,
+            max_connections: 8,
+            many_connections: false,
+            show_complete: true,
+            complete_snoozed_until: None,
+            hold_popups: true,
+            double_click_open: false,
+            confirm_delete: true,
+            categories_width: 143,
+            window: None,
+            window_maximized: false,
+            show_categories: true,
+            branches: [true, false, false, false],
+            preview_pane: false,
+            preview_width: crate::preview::DEFAULT_WIDTH,
+            view: None,
+            dark_mode_support: true,
+            always_dark: false,
+            theme: "classic".into(),
+            renderer: None,
+            window_system: None,
+            interface_size: 100,
+            interface_font: None,
+            interface_text_size: 100,
+            smooth_text: false,
+            limits_on: false,
+            limits_mb: 200,
+            limits_hours: 5,
+            limits_warn: true,
+            launch_on_startup: false,
+            language: None,
+            language_asked: false,
+            helpers_asked: false,
+            extension_never_ask: false,
+            clipboard_autostart: true,
+            minimize_to_tray: true,
+            tray_panel: true,
+            close_to_tray: true,
+            keep_private_downloads: true,
+            private_notice_shown: false,
+            show_hide_hotkey: String::new(),
+            mv2_extensions: true,
+            advanced_integration: true,
+            browsers: BROWSERS.iter().map(|b| (b.to_string(), true)).collect(),
+            auto_types: DEFAULT_AUTO_TYPES.into(),
+            excluded_sites: DEFAULT_EXCLUDED_SITES.into(),
+            excluded_addresses: Vec::new(),
+            video_panel: true,
+            video_panel_sites: String::new(),
+            video_panel_compact: false,
+            video_panel_full: false,
+            video_panel_scale: 100,
+            capture_opened: true,
+            capture_min_kb: 0,
+            regional: crate::regional::Regional::default(),
+            category_dirs: Vec::new(),
+            change_folder_on_last: true,
+            one_folder: false,
+            url_history: Vec::new(),
+            folder_history: Vec::new(),
+            set_creation_date: false,
+            mark_downloads: true,
+            show_start_dialog: true,
+            show_progress: true,
+            only_add_to_queue: false,
+            start_immediately: true,
+            queue_panel_later: true,
+            queue_panel_batch: true,
+            ignore_mtime: false,
+            duplicate_action: 0,
+            user_agent: String::new(),
+            conn_exceptions: Vec::new(),
+            site_rules: Vec::new(),
+            proxy_from_browser: true,
+            proxy_mode: 0,
+            proxy_script: String::new(),
+            proxy_host: String::new(),
+            proxy_port: String::new(),
+            proxy_user: String::new(),
+            proxy_pass: String::new(),
+            archive_passwords: String::new(),
+            proxy_http: false,
+            proxy_https: false,
+            proxy_ftp: false,
+            proxy_kind: ProxyKind::Http,
+            proxy_remote_dns: true,
+            dns_mode: 0,
+            dns_provider: "cloudflare".into(),
+            dns_servers: String::new(),
+            dns_tls_name: String::new(),
+            dns_doh_url: String::new(),
+            dns_nextdns_id: String::new(),
+            dns_fallback: false,
+            net_adapter: String::new(),
+            ftp_passive: true,
+            site_logins: Vec::new(),
+            debrid_accounts: Vec::new(),
+            debrid_on: true,
+            debrid_torrents: false,
+            sounds: Default::default(),
+            automation_api: false,
+            remote_on: false,
+            remote_port: mdm_remote::PORT,
+            remote_listen: String::new(),
+            torrent_keep_sharing: false,
+            torrent_associations: None,
+            torrent_associations_before: false,
+            torrent_incoming: true,
+            torrent_upnp: true,
+            torrent_port: 0,
+            torrent_utp: true,
+            torrent_dht: true,
+            torrent_lsd: true,
+            torrent_proxy: false,
+            torrent_blocklist: String::new(),
+            torrent_public_trackers: false,
+            torrent_public_trackers_url: String::new(),
+            torrent_stop_idle: true,
+            torrent_upload_on: false,
+            torrent_upload_kb: 100,
+            torrent_stop_ratio_on: false,
+            torrent_stop_ratio: 200,
+            torrent_stop_minutes_on: false,
+            torrent_stop_minutes: 1440,
+            update_check: true,
+            update_checked: 0,
+            custom_categories: Vec::new(),
+            builtin_categories: Vec::new(),
+            drop_target: false,
+            drop_target_pos: None,
+            video_subs: Default::default(),
+            video_chapters: true,
+            video_split_chapters: false,
+            video_cookies: String::new(),
+            video_cookies_profile: String::new(),
+            ytdlp_config: false,
+            extract_auto: false,
+            extract_delete: false,
+            extract_in_place: false,
+            seven_zip_path: String::new(),
+            extract_subfolder: 0,
+            test_archives: true,
+            test_archives_gb: 4,
+            grabber_check: true,
+            grabber_hide_pages: true,
+            grabber_depth: 3,
+            grabber_types: String::new(),
+            cnl_on: false,
+            cnl_sites: Vec::new(),
+        }
+    }
+}
+
+impl Settings {
+    /// #1058: Torrent settings' switch as the user chose it, for a list that never decided it
+    /// (None): ticked in an earlier version (a saved true was the user's), else what the
+    /// installer's task left (`installer`: ticked or not; None for a portable copy or no
+    /// installer), else whether this program is what the system opens .torrent files with now
+    /// (`registered`, asked only then). Once decided, the box and the browser's hand-off follow
+    /// the saved value only: a later look at the system would tick it again after the user
+    /// unticked it while everyone's association (HKLM) stays. True when it changed (to save).
+    pub fn settle_torrent_handler(
+        &mut self,
+        installer: Option<bool>,
+        registered: impl FnOnce() -> bool,
+    ) -> bool {
+        if self.torrent_associations.is_some() {
+            return false;
+        }
+        let on = self.torrent_associations_before || installer.unwrap_or_else(registered);
+        self.torrent_associations = Some(on);
+        true
+    }
+
+    /// The settings as the list file writes them (#44, secrets.rs): each secret's field holds
+    /// its keychain reference once the keychain holds it, else the secret sealed as before
+    /// (and the keychain is asked to take it). Serialized inside `secrets::prepared`, where these
+    /// fields go as they are. Also called at start: secrets from before go to the keychain then.
+    pub fn for_disk(&self) -> Settings {
+        let vault = crate::secrets::vault();
+        let mut pass = vault.pass();
+        let mut disk = self.clone();
+        let mut keys = std::collections::HashSet::new();
+        let mut kept = |key: String, label: &dyn Fn() -> String, secret: &str| {
+            // A key once (two logins for the same site and user get one each).
+            let mut k = key.clone();
+            let mut n = 2;
+            while !keys.insert(k.clone()) {
+                k = format!("{key}-{n}");
+                n += 1;
+            }
+            pass.secret(&k, label, secret)
+                .unwrap_or_else(|| sealed::seal(secret))
+        };
+        // Their names in the system's keychain (Credential Manager, the keyring).
+        disk.proxy_pass = kept(
+            "proxy".into(),
+            &|| {
+                format!(
+                    "Mister Download Manager: {} {}:{}",
+                    // i18n: the proxy's password in the system's keychain (Credential Manager, the keyring): its name there, followed by the proxy's address
+                    crate::i18n::t("proxy server"),
+                    self.proxy_host,
+                    self.proxy_port
+                )
+            },
+            &self.proxy_pass,
+        );
+        disk.archive_passwords = kept(
+            "archives/passwords".into(),
+            &|| {
+                format!(
+                    "Mister Download Manager: {}",
+                    // i18n: the list of archive passwords in the system's keychain (Credential Manager, the keyring): its name there
+                    crate::i18n::t("archive passwords")
+                )
+            },
+            &self.archive_passwords,
+        );
+        for (a, d) in self.debrid_accounts.iter().zip(&mut disk.debrid_accounts) {
+            d.secret = kept(
+                format!("debrid/{}", a.id),
+                &|| format!("Mister Download Manager: {} ({})", a.service.name(), a.user),
+                &a.secret,
+            );
+        }
+        for ((site, user, pw), d) in self.site_logins.iter().zip(&mut disk.site_logins) {
+            d.2 = kept(
+                format!(
+                    "login/{:016x}",
+                    fnv(&format!(
+                        "{site}
+{user}"
+                    ))
+                ),
+                &|| format!("Mister Download Manager: {site} ({user})"),
+                pw,
+            );
+        }
+        pass.finish();
+        disk
+    }
+
+    /// Options → Archives' passwords, in the order they are tried.
+    pub fn archive_password_list(&self) -> Vec<String> {
+        password_lines(&self.archive_passwords)
+    }
+
+    /// `password` first in that list (added, or moved up): it opened an archive, or the user
+    /// asked to remember it.
+    pub fn remember_archive_password(&mut self, password: &str) {
+        if password.is_empty() || password.contains(['\n', '\r']) {
+            return;
+        }
+        let mut list = self.archive_password_list();
+        list.retain(|p| p != password);
+        list.insert(0, password.to_owned());
+        self.archive_passwords = list.join("\n");
+    }
+
+    /// The largest archive tested when its download completes, in bytes (Options → Archives,
+    /// at least 1 GB).
+    pub fn test_limit(&self) -> u64 {
+        u64::from(self.test_archives_gb.max(1)) << 30
+    }
+
+    /// Options → Archives' folder choice, for mdm-extract.
+    pub fn extract_into(&self) -> mdm_extract::Subfolder {
+        match self.extract_subfolder {
+            1 => mdm_extract::Subfolder::Always,
+            2 => mdm_extract::Subfolder::Never,
+            _ => mdm_extract::Subfolder::Smart,
+        }
+    }
+}
+
+/// The passwords of a list typed one a line: blank lines out, each once, spaces kept (a password
+/// may have them).
+pub fn password_lines(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| seen.insert(l.to_string()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// FNV-1a: a stable hash (std's may change between builds), for keychain keys.
+pub(crate) fn fnv(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// The most entries a drop list keeps.
+pub const HISTORY: usize = 20;
+
+/// Put `value` first in a drop list's history: once, newest first, at most `HISTORY`.
+pub fn remember(list: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    list.retain(|v| v != value);
+    list.insert(0, value.to_owned());
+    list.truncate(HISTORY);
+}
+
+/// A saved "User-Agent for manually added downloads": MDM's former default (Internet Explorer
+/// 11's, before #668) or nothing is the automatic one (empty).
+fn automatic_agent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let saved = String::deserialize(d)?;
+    Ok(if saved.trim() == mdm_engine::agent::IE11_USER_AGENT {
+        String::new()
+    } else {
+        saved
+    })
+}
+
+impl Settings {
+    /// The User-Agent the user set for links added by hand; None: the automatic one (the
+    /// default browser's, #668).
+    pub fn own_user_agent(&self) -> Option<&str> {
+        let ua = self.user_agent.trim();
+        (!ua.is_empty() && ua != mdm_engine::agent::IE11_USER_AGENT).then_some(ua)
+    }
+
+    /// `live` with the settings a dialog changed (`from` → `to`) put in, field by field: what
+    /// changed elsewhere while it was open (the toolbar's Speed Limiter, Torrent settings, the
+    /// Categories pane) is kept, not reverted to the copy the dialog started from.
+    pub fn merge_changes(live: &Settings, from: &Settings, to: &Settings) -> Settings {
+        let value = |s: &Settings| serde_json::to_value(s).unwrap_or_default();
+        let (mut out, before, after) = (value(live), value(from), value(to));
+        if let (Some(out), Some(before), Some(after)) =
+            (out.as_object_mut(), before.as_object(), after.as_object())
+        {
+            for (k, v) in after {
+                if before.get(k) != Some(v) {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        serde_json::from_value(out).unwrap_or_else(|_| to.clone())
+    }
+
+    /// Options → Save to: the category's folder (its own choice, else `Downloads\<Category>`).
+    pub fn category_dir(
+        &self,
+        cat: crate::model::Category,
+        downloads: &std::path::Path,
+    ) -> std::path::PathBuf {
+        crate::model::category_folder(cat, downloads, &self.category_dirs)
+    }
+
+    /// The folder a new download of this category goes to: its category's, or General's for
+    /// every category with one folder for every download (#1973).
+    pub fn save_dir(
+        &self,
+        cat: crate::model::Category,
+        downloads: &std::path::Path,
+    ) -> std::path::PathBuf {
+        self.category_dir(self.folder_category(cat), downloads)
+    }
+
+    /// The category whose folder a new download of `cat` takes and "Remember this path"
+    /// changes: `cat` itself, or General with one folder for every download (#1973).
+    pub fn folder_category(&self, cat: crate::model::Category) -> crate::model::Category {
+        crate::model::folder_category(cat, self.one_folder)
+    }
+
+    /// The folder a download of `cat` was saved to becomes the folder its kind of download
+    /// takes from now on ([`Self::keep_category_dir`] for [`Self::folder_category`]).
+    pub fn keep_save_dir(
+        &mut self,
+        cat: crate::model::Category,
+        dir: &std::path::Path,
+        downloads: &std::path::Path,
+    ) -> bool {
+        self.keep_category_dir(self.folder_category(cat), dir, downloads)
+    }
+
+    /// Manual proxy/socks configuration as it is set (#1558): its type, whether names are looked
+    /// up through it, and its address without a scheme (`host` or `host:port`). An address
+    /// typed with a proxy's scheme (`socks5://host`, as the docs said before Type) says the type
+    /// itself. None when no address is typed.
+    pub fn manual_proxy(&self) -> Option<(ProxyKind, bool, String)> {
+        let host = self.proxy_host.trim().trim_end_matches('/');
+        if host.is_empty() {
+            return None;
+        }
+        let typed = host
+            .split_once("://")
+            .and_then(|(scheme, rest)| Some((ProxyKind::from_scheme(scheme)?, rest)));
+        let (kind, remote, host) = match typed {
+            Some(((kind, remote), rest)) => (kind, remote, rest),
+            None => (self.proxy_kind, self.proxy_remote_dns, host),
+        };
+        let at = match self.proxy_port.trim() {
+            "" => host.to_owned(),
+            port => format!("{host}:{port}"),
+        };
+        Some((kind, remote, at))
+    }
+
+    /// The manual proxy's address with its scheme (and the port), as the engine and the
+    /// helpers take it: `socks5h://127.0.0.1:1080`. None when no address is typed.
+    pub fn manual_proxy_url(&self) -> Option<String> {
+        let (kind, remote, at) = self.manual_proxy()?;
+        Some(format!("{}://{at}", kind.scheme(remote)))
+    }
+
+    /// The SOCKS5 proxy torrents may use: Proxy / Socks' manual one when it is a SOCKS5 one,
+    /// with its login; librqbit takes no other kind.
+    pub fn socks5_proxy(&self) -> Option<String> {
+        if self.proxy_mode != 3 || self.manual_proxy()?.0 != ProxyKind::Socks5 {
+            return None;
+        }
+        let mut url = url::Url::parse(&self.manual_proxy_url()?).ok()?;
+        if !self.proxy_user.is_empty() {
+            let _ = url.set_username(&self.proxy_user);
+            let _ = url.set_password(Some(&self.proxy_pass));
+        }
+        Some(url.as_str().trim_end_matches('/').to_owned())
+    }
+
+    /// The public tracker list's address (#1776): the one given, else the default list.
+    pub fn public_trackers_list(&self) -> &str {
+        match self.torrent_public_trackers_url.trim() {
+            "" => mdm_torrent::public_trackers::DEFAULT_LIST,
+            url => url,
+        }
+    }
+
+    /// The torrent engine as Torrent settings say (#40), its data in `state_dir`. None when they
+    /// say to use the proxy and Proxy / Socks has no SOCKS5 one: torrents then don't start, never
+    /// going around the proxy unasked.
+    pub fn torrent_config(&self, state_dir: std::path::PathBuf) -> Option<mdm_torrent::Config> {
+        let proxy = match (self.torrent_proxy, self.socks5_proxy()) {
+            (true, None) => return None,
+            (true, proxy) => proxy,
+            (false, _) => None,
+        };
+        let blocklist = (!self.torrent_blocklist.trim().is_empty())
+            .then(|| state_dir.join(crate::torrents::BLOCKLIST_FILE));
+        Some(mdm_torrent::Config {
+            listen: self.torrent_incoming,
+            upnp: self.torrent_upnp,
+            port: (self.torrent_port != 0).then_some(self.torrent_port),
+            utp: self.torrent_utp,
+            dht: self.torrent_dht,
+            lsd: self.torrent_lsd,
+            proxy,
+            blocklist,
+            // The chosen network adapter (#35, #143); the session takes it again when it starts.
+            bind: crate::torrents::route_bind(&own_route()).ok().flatten(),
+            ..mdm_torrent::Config::new(state_dir)
+        })
+    }
+
+    /// Options → Proxy / Socks for the engine. An automatic configuration script (PAC) is run
+    /// once it has been fetched (pacfetch.rs); until then, the system's settings.
+    pub fn proxy(&self) -> mdm_engine::Proxy {
+        use mdm_engine::Proxy;
+        // The system's settings, with its automatic configuration script when one is on and
+        // has been fetched (#1448: a proxy program's PAC mode, `pacfetch::watch_system`).
+        let system = || {
+            crate::pacfetch::system_script().map_or(Proxy::System, |script| Proxy::Pac { script })
+        };
+        let manual = self.manual_proxy().map(|(kind, _, _)| kind);
+        match self.proxy_mode {
+            1 => system(),
+            2 => crate::pacfetch::script(&self.proxy_script)
+                .map_or(Proxy::System, |script| Proxy::Pac { script }),
+            3 if manual.is_some() => {
+                let kind = manual.unwrap_or_default();
+                Proxy::Manual {
+                    url: self.manual_proxy_url().unwrap_or_default(),
+                    login: (kind.has_login() && !self.proxy_user.is_empty())
+                        .then(|| (self.proxy_user.clone(), self.proxy_pass.clone())),
+                    // A SOCKS proxy carries every connection: the http / https boxes are an HTTP
+                    // proxy's (#1558).
+                    http: kind.is_socks() || self.proxy_http,
+                    https: kind.is_socks() || self.proxy_https,
+                }
+            }
+            // "Use proxy/socks from a browser's request": browsers use Windows' proxy settings,
+            // so with no proxy of our own so do we (none set there: direct, as before).
+            _ if self.proxy_from_browser => system(),
+            _ => Proxy::None,
+        }
+    }
+
+    /// Whether [`Self::proxy`] is the system's settings ("Use system settings", or the
+    /// browser's proxy with no proxy of MDM's own): the system's script is then watched for.
+    pub fn follows_system(&self) -> bool {
+        match self.proxy_mode {
+            1 => true,
+            2 => false,
+            3 if self.manual_proxy().is_some() => false,
+            _ => self.proxy_from_browser,
+        }
+    }
+
+    /// The proxy for a download that came with `context` (#42): the browser's own, when it used
+    /// one for it (a VPN or proxy extension, or its settings) and "Use proxy/socks from a
+    /// browser's request" is on; else [`Self::proxy`]. A proxy the extension logs in to is
+    /// refused (`browser_proxy_refused`), never replaced by a direct connection.
+    pub fn proxy_for(&self, context: &mdm_ipc::Command) -> mdm_engine::Proxy {
+        use mdm_engine::Proxy;
+        if self.proxy_from_browser {
+            if let Some(url) = &context.proxy {
+                return Proxy::Manual {
+                    url: url.clone(),
+                    login: None,
+                    http: true,
+                    https: true,
+                };
+            }
+            if let Some(script) = &context.proxy_pac {
+                return Proxy::Pac {
+                    script: std::sync::Arc::from(script.as_str()),
+                };
+            }
+        }
+        self.proxy()
+    }
+
+    /// Why a download from the browser can't start (#42): its proxy asks for a login that the
+    /// VPN or proxy extension gives, which MDM can't have. Going around it would show the
+    /// user's own address, so the download stops and says so.
+    pub fn browser_proxy_refused(&self, context: &mdm_ipc::Command) -> Option<String> {
+        (self.proxy_from_browser && context.proxy_login).then(|| {
+            // i18n: an error: the browser's VPN or proxy extension logs in to its proxy itself, and MDM can't; Options → Proxy / Socks → Network adapter is where an adapter can be chosen
+            crate::i18n::t(
+                "the browser's proxy (a VPN or proxy extension) asks for a login only that extension has: use the VPN's own app, or choose its network adapter in Options → Proxy / Socks",
+            )
+            .to_owned()
+        })
+    }
+
+    /// Options → Connection → DNS for the engine. A setting that can't work (no server typed,
+    /// an address that isn't one) gives the system's DNS; Options won't take one with OK.
+    pub fn dns(&self) -> mdm_engine::DnsChoice {
+        dns_choice(
+            self.dns_mode,
+            &self.dns_provider,
+            &self.dns_servers,
+            &self.dns_tls_name,
+            &self.dns_doh_url,
+            &self.dns_nextdns_id,
+            self.dns_fallback,
+        )
+        .unwrap_or_default()
+    }
+
+    /// The most connections Options → Connection lets a download use: 32, or 128 once more are
+    /// allowed.
+    pub fn connection_limit(&self) -> u32 {
+        if self.many_connections {
+            mdm_engine::download::MAX_CONNECTIONS_UNLOCKED
+        } else {
+            mdm_engine::download::MAX_CONNECTIONS
+        }
+    }
+
+    /// Connections for a download from `url`: the first server exception that names it
+    /// (Options → Connection, a site rule's number among them: `*` for any text, the first
+    /// match winning), else the default; never more than `connection_limit` (a
+    /// hand-edited file can hold anything).
+    pub fn connections_for(&self, url: &url::Url) -> u32 {
+        self.site_settings(url)
+            .connections
+            .unwrap_or(self.max_connections)
+            .clamp(1, self.connection_limit())
+    }
+
+    /// What the site rules and the exceptions give a download from `url` (#1778).
+    pub fn site_settings(&self, url: &url::Url) -> mdm_ipc::siterules::Applied {
+        mdm_ipc::siterules::for_url(&self.site_rules, &self.conn_exceptions, url)
+    }
+
+    /// The Sites Logins entry for `url`: its site/path is a prefix of the address (without the
+    /// scheme), on whole path segments; `*.` matches subdomains. Of several entries that match,
+    /// the longest (the most specific) gives the login, the first of them when they are as long.
+    pub fn site_login(&self, url: &url::Url) -> Option<(String, String)> {
+        let host = url.host_str()?.to_ascii_lowercase();
+        let path = url.path().trim_start_matches('/');
+        self.site_logins
+            .iter()
+            .filter_map(|(site, user, pass)| {
+                let site = site.trim();
+                let site = site.split_once("://").map_or(site, |(_, rest)| rest);
+                let (site_host, site_path) = site.split_once('/').unwrap_or((site, ""));
+                let site_path = site_path.trim_matches('/');
+                let matched = host_matches(&host, site_host)
+                    && (site_path.is_empty()
+                        || path == site_path
+                        || path
+                            .strip_prefix(site_path)
+                            .is_some_and(|rest| rest.starts_with('/')));
+                matched.then(|| (site_path.len(), (user.clone(), pass.clone())))
+            })
+            // The first of the longest: `max_by_key` would take the last of equal ones, and the
+            // list's own order decides between them, as it did before.
+            .min_by_key(|(len, _)| std::cmp::Reverse(*len))
+            .map(|(_, login)| login)
+    }
+
+    /// Should a copied link named `name` be offered? Fewer types than a browser hands over
+    /// (`mdm_ipc::capture::clipboard_type`).
+    pub fn clipboard_type(&self, name: &str) -> bool {
+        mdm_ipc::capture::clipboard_type(&self.auto_types, name)
+    }
+
+    /// Set (or forget, with `None`) the category's own folder.
+    pub fn set_category_dir(&mut self, cat: crate::model::Category, dir: Option<String>) {
+        if let crate::model::Category::Custom(id) = cat {
+            if let Some(c) = self.custom_categories.iter_mut().find(|c| c.id == id)
+                && c.folder != dir
+            {
+                c.folder = dir;
+                crate::model::set_custom(&self.custom_categories);
+            }
+            return;
+        }
+        // Under the built-in's shipped name: a rename keeps its folder.
+        let key = cat.key();
+        self.category_dirs.retain(|(c, _)| *c != *key);
+        if let Some(d) = dir {
+            self.category_dirs.push((key.into_owned(), d));
+        }
+    }
+
+    /// The folder just saved into becomes the category's, when it is another one (an unchanged
+    /// folder stays "the default", following Downloads). True when the folder changed.
+    pub fn keep_category_dir(
+        &mut self,
+        cat: crate::model::Category,
+        dir: &std::path::Path,
+        downloads: &std::path::Path,
+    ) -> bool {
+        if dir.as_os_str().is_empty() || dir == self.category_dir(cat, downloads) {
+            return false;
+        }
+        self.set_category_dir(cat, Some(dir.display().to_string()));
+        true
+    }
+
+    /// Both category registries (the user's and the built-in ones' edits) from these settings,
+    /// for code that only has a `Category`.
+    pub fn publish_categories(&self) {
+        crate::model::set_custom(&self.custom_categories);
+        crate::model::set_builtin(&self.builtin_categories);
+    }
+
+    /// The per-download limit new downloads start with, bytes/s.
+    pub fn speed_limit(&self) -> Option<u64> {
+        self.speed_limit_on
+            .then_some(self.speed_limit_kb.max(1) * 1024)
+    }
+
+    /// Torrent settings' seeding limits: the share ratio and the seconds of sharing at which a
+    /// finished torrent stops being shared (None: that limit is off).
+    pub fn sharing_limits(&self) -> crate::torrents::SharingLimits {
+        crate::torrents::SharingLimits {
+            ratio: self
+                .torrent_stop_ratio_on
+                .then(|| f64::from(self.torrent_stop_ratio.max(1)) / 100.0),
+            secs: self
+                .torrent_stop_minutes_on
+                .then(|| u64::from(self.torrent_stop_minutes.max(1)) * 60),
+        }
+    }
+
+    /// Torrent settings' upload limit for all torrents together, bytes/s (None: off).
+    pub fn torrent_upload_limit(&self) -> Option<u64> {
+        self.torrent_upload_on
+            .then_some(self.torrent_upload_kb.max(1) * 1024)
+    }
+}
+
+/// DNS mode numbers (`Settings::dns_mode`) as the engine's.
+pub fn dns_mode(n: u8) -> Option<mdm_engine::dns::Mode> {
+    use mdm_engine::dns::Mode;
+    match n {
+        1 => Some(Mode::Plain),
+        2 => Some(Mode::Tls),
+        3 => Some(Mode::Https),
+        _ => None,
+    }
+}
+
+/// The engine's DNS choice from Options → DNS's fields; `Err` says what is wrong.
+pub fn dns_choice(
+    mode: u8,
+    provider: &str,
+    servers: &str,
+    tls_name: &str,
+    doh_url: &str,
+    nextdns_id: &str,
+    fallback: bool,
+) -> Result<mdm_engine::DnsChoice, String> {
+    use mdm_engine::dns::{Dns, Mode, Preset, parse_servers, valid_nextdns_profile};
+    let Some(m) = dns_mode(mode) else {
+        return Ok(mdm_engine::DnsChoice::default());
+    };
+    let how = match m {
+        // i18n: a way of asking a DNS, in its name in messages: "Cloudflare (plain DNS)"
+        Mode::Plain => crate::i18n::t("plain DNS"),
+        // i18n: a way of asking a DNS, in its name in messages: "Cloudflare (DNS over TLS)"
+        Mode::Tls => crate::i18n::t("DNS over TLS"),
+        // i18n: a way of asking a DNS, in its name in messages: "Cloudflare (DNS over HTTPS)"
+        Mode::Https => crate::i18n::t("DNS over HTTPS"),
+    };
+    if let Some(p) = Preset::by_id(provider) {
+        if !p.offers(m) {
+            return Err(crate::i18n::fmt(
+                // i18n: Options → DNS: this service can't be asked this way; {how} is e.g. "plain DNS"
+                crate::i18n::t("{name} isn't offered as {how}."),
+                &[("name", p.name), ("how", how)],
+            ));
+        }
+        if !valid_nextdns_profile(nextdns_id) {
+            return Err(
+                // i18n: Options → DNS: the NextDNS configuration ID typed isn't one
+                crate::i18n::t("A NextDNS configuration ID is six letters and digits (0-9, a-f).")
+                    .to_owned(),
+            );
+        }
+        return Ok(p.choice(m, nextdns_id, fallback, format!("{} ({how})", p.name)));
+    }
+    // i18n: Options → DNS: the name of a DNS the user typed in, in messages: "your DNS (DNS over TLS)"
+    let label = crate::i18n::fmt(crate::i18n::t("your DNS ({how})"), &[("how", how)]);
+    let bad = |what: String| {
+        crate::i18n::fmt(
+            // i18n: Options → DNS: a server address typed isn't an IP address; {what} is what was typed
+            crate::i18n::t("\"{what}\" isn't an IP address."),
+            &[("what", &what)],
+        )
+    };
+    // i18n: Options → DNS: no server address was typed
+    let none = || crate::i18n::t("Type at least one server address.").to_owned();
+    let dns = match m {
+        Mode::Plain => {
+            let s = parse_servers(servers, 53).map_err(bad)?;
+            if s.is_empty() {
+                return Err(none());
+            }
+            Dns::Plain(s)
+        }
+        Mode::Tls => {
+            let s = parse_servers(servers, 853).map_err(bad)?;
+            if s.is_empty() {
+                return Err(none());
+            }
+            let name = tls_name.trim();
+            if name.is_empty() {
+                return Err(
+                    // i18n: Options → DNS over TLS: the server's name (as its certificate shows it) is missing
+                    crate::i18n::t("Type the name the server's certificate shows.").to_owned(),
+                );
+            }
+            Dns::Tls {
+                name: name.to_owned(),
+                servers: s,
+            }
+        }
+        Mode::Https => {
+            let url = doh_url.trim();
+            if !url.starts_with("https://") || url::Url::parse(url).is_err() {
+                // i18n: Options → DNS over HTTPS: the address typed isn't a valid https:// address
+                return Err(crate::i18n::t("Type the server's https:// address.").to_owned());
+            }
+            Dns::Https {
+                url: url.to_owned(),
+                bootstrap: parse_servers(servers, 0)
+                    .map_err(bad)?
+                    .into_iter()
+                    .map(|a| a.ip())
+                    .collect(),
+            }
+        }
+    };
+    Ok(mdm_engine::DnsChoice {
+        dns,
+        fallback,
+        label,
+    })
+}
+
+/// The proxy MDM's own downloads go through (its helpers, its updates, a crash report's
+/// symbols): Options → Proxy / Socks, kept in step by the app ([`share_proxy`]); Windows' own
+/// settings in a process without them (the crash monitor).
+static OWN_PROXY: std::sync::RwLock<Option<mdm_engine::Proxy>> = std::sync::RwLock::new(None);
+/// The same for Options → Connection → DNS ([`share_dns`]).
+static OWN_DNS: std::sync::RwLock<Option<mdm_engine::DnsChoice>> = std::sync::RwLock::new(None);
+
+/// Keep [`own_net`] on the settings' proxy (cheap when it didn't change).
+pub fn share_proxy(proxy: mdm_engine::Proxy) {
+    // yt-dlp and gallery-dl go through it too (#363).
+    mdm_tools::proc::set_proxy(proxy.clone());
+    if OWN_PROXY.read().unwrap().as_ref() != Some(&proxy) {
+        *OWN_PROXY.write().unwrap() = Some(proxy);
+    }
+}
+
+/// Keep [`own_net`] on the settings' DNS (cheap when it didn't change), and the helpers' relay
+/// (#35: the servers of video pages and galleries are looked up with it while an adapter is
+/// chosen).
+pub fn share_dns(dns: mdm_engine::DnsChoice) {
+    if OWN_DNS.read().unwrap().as_ref() != Some(&dns) {
+        *OWN_DNS.write().unwrap() = Some(dns.clone());
+    }
+    mdm_tools::proc::set_dns(dns);
+}
+
+static OWN_ROUTE: std::sync::RwLock<mdm_engine::Route> =
+    std::sync::RwLock::new(mdm_engine::Route::Any);
+
+/// Keep [`own_net`], yt-dlp and the media-server checks on the chosen network adapter as it is
+/// now (#35; the adapter watch in `netwatch`).
+pub fn share_route(route: mdm_engine::Route) {
+    if *OWN_ROUTE.read().unwrap() != route {
+        *OWN_ROUTE.write().unwrap() = route.clone();
+    }
+    mdm_tools::proc::set_route(route);
+}
+
+impl Settings {
+    /// Options → Sites Logins → Cookies for video sites, as yt-dlp is given it (None: off, or
+    /// a browser yt-dlp doesn't read).
+    pub fn video_cookies(&self) -> Option<mdm_tools::proc::BrowserCookies> {
+        mdm_tools::proc::BrowserCookies::new(&self.video_cookies, &self.video_cookies_profile)
+    }
+}
+
+/// Keep every yt-dlp run on Options' cookies for video sites (cheap when they didn't change)
+/// and on Use my yt-dlp config file, and every video started on Embed chapters (#827).
+pub fn share_video_settings(s: &Settings) {
+    mdm_tools::proc::set_browser_cookies(s.video_cookies());
+    mdm_tools::proc::set_user_config(s.ytdlp_config);
+    mdm_tools::video::set_chapters(s.video_chapters);
+    mdm_tools::video::set_split_chapters(s.video_split_chapters);
+}
+
+/// The network adapter MDM's connections go through now (#35).
+pub fn own_route() -> mdm_engine::Route {
+    OWN_ROUTE.read().unwrap().clone()
+}
+
+/// The command line's network (#1556): Options → Proxy / Socks (the proxy and the network
+/// adapter), Connection → DNS and Torrent settings' proxy, read from the settings as a command
+/// starts (the defaults when there are none yet: the system's proxy). An automatic configuration
+/// script, Options' or the system's for "Use system settings", is fetched first: the app has it
+/// fetched by the time it downloads, and a command downloads at once.
+pub fn cli_net() -> mdm_cli::Net {
+    let s = crate::store::settings_only().unwrap_or_default();
+    // The script is fetched through the chosen adapter, as the app fetches it.
+    share_route(mdm_engine::net::route_for(
+        &s.net_adapter,
+        &mdm_engine::net::adapters(),
+    ));
+    if s.proxy_mode == 2 {
+        crate::pacfetch::fetch_now(&s.proxy_script);
+    } else if s.follows_system() {
+        crate::pacfetch::system_now();
+    }
+    s.cli_net()
+}
+
+impl Settings {
+    /// [`cli_net`] from these settings, the scripts already fetched.
+    pub fn cli_net(&self) -> mdm_cli::Net {
+        mdm_cli::Net {
+            proxy: self.proxy(),
+            dns: self.dns(),
+            adapter: self.net_adapter.trim().to_owned(),
+            torrent_proxy: match (self.torrent_proxy, self.socks5_proxy()) {
+                (false, _) => mdm_cli::TorrentProxy::Off,
+                (true, Some(p)) => mdm_cli::TorrentProxy::Through(p),
+                (true, None) => mdm_cli::TorrentProxy::Missing,
+            },
+            // The same switch, address and cache as the app's (#1776).
+            public_trackers: self
+                .torrent_public_trackers
+                .then(crate::torrents::state_dir)
+                .flatten()
+                .map(|dir| mdm_cli::PublicTrackers {
+                    url: self.public_trackers_list().to_owned(),
+                    dir,
+                }),
+            // Site rules and exceptions (#1778): the command line asks a site as the app does.
+            sites: mdm_cli::SiteRules {
+                rules: self.site_rules.clone(),
+                exceptions: self.conn_exceptions.clone(),
+            },
+        }
+    }
+}
+
+/// How MDM downloads its own files: its engine, as itself, through the user's proxy, DNS and
+/// network adapter.
+pub fn own_net() -> mdm_engine::Options {
+    let proxy = OWN_PROXY
+        .read()
+        .unwrap()
+        .clone()
+        .unwrap_or(mdm_engine::Proxy::System);
+    mdm_engine::Options {
+        dns: OWN_DNS.read().unwrap().clone().unwrap_or_default(),
+        route: own_route(),
+        ..mdm_tools::net(proxy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// #1776: the public tracker list is off by default, its address the default list's; the
+    /// default list is saved as none given, another address as typed (trimmed).
+    #[test]
+    fn the_public_tracker_list_is_off_until_turned_on() {
+        use super::Settings;
+        use crate::torrentdlg::Net;
+        use mdm_torrent::public_trackers::DEFAULT_LIST;
+        let old: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        let mut s = Settings::default();
+        for s in [&old, &s] {
+            assert!(!s.torrent_public_trackers);
+            assert_eq!(s.public_trackers_list(), DEFAULT_LIST);
+        }
+        let mut net = Net::of(&s);
+        assert!(!net.public_trackers);
+        assert_eq!(net.public_list, DEFAULT_LIST);
+        net.public_trackers = true;
+        net.apply(&mut s);
+        assert!(s.torrent_public_trackers);
+        assert_eq!(s.torrent_public_trackers_url, "");
+        let mut net = Net::of(&s);
+        net.public_list = " https://lists.example.org/trackers.txt ".into();
+        net.apply(&mut s);
+        assert_eq!(
+            s.public_trackers_list(),
+            "https://lists.example.org/trackers.txt"
+        );
+        let again: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert!(again.torrent_public_trackers);
+        assert_eq!(
+            again.public_trackers_list(),
+            "https://lists.example.org/trackers.txt"
+        );
+        // Emptied: the default list again.
+        let mut net = Net::of(&s);
+        net.public_list = "  ".into();
+        net.apply(&mut s);
+        assert_eq!(s.public_trackers_list(), DEFAULT_LIST);
+    }
+
+    /// #668: the User-Agent for links added by hand is the default browser's unless one is set.
+    /// Saved before, MDM's former default (Internet Explorer 11's) or nothing reads as automatic;
+    /// automatic is saved empty, which an older MDM reads as its own default again.
+    #[test]
+    fn the_user_agent_is_automatic_unless_one_is_set() {
+        use super::Settings;
+        let ie11 = mdm_engine::agent::IE11_USER_AGENT;
+        assert_eq!(Settings::default().user_agent, "");
+        assert_eq!(Settings::default().own_user_agent(), None);
+        for saved in [
+            serde_json::json!({ "user_agent": ie11 }),
+            serde_json::json!({ "user_agent": format!(" {ie11} ") }),
+            serde_json::json!({ "user_agent": "" }),
+            serde_json::json!({ "user_agent": "   " }),
+            serde_json::json!({}),
+        ] {
+            let s: Settings = serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(s.own_user_agent(), None, "{saved}");
+            let again = serde_json::to_value(&s).unwrap();
+            assert_eq!(
+                again["user_agent"].as_str().map(str::trim),
+                Some(""),
+                "{saved}"
+            );
+        }
+        let own: Settings =
+            serde_json::from_value(serde_json::json!({ "user_agent": " MyAgent/1.0 " })).unwrap();
+        assert_eq!(own.own_user_agent(), Some("MyAgent/1.0"));
+        let again: Settings = serde_json::from_value(serde_json::to_value(&own).unwrap()).unwrap();
+        assert_eq!(again.own_user_agent(), Some("MyAgent/1.0"));
+    }
+
+    /// #1489: a settings file written before View → Font existed reads as the computer's own
+    /// font at the theme's sizes, and nothing chosen is saved as nothing.
+    #[test]
+    fn view_font_keeps_its_defaults_in_older_settings() {
+        use super::Settings;
+        let saved = serde_json::json!({ "interface_size": 125 });
+        let s: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(s.interface_font, None);
+        assert_eq!(s.interface_text_size, 100);
+        let again = serde_json::to_value(&s).unwrap();
+        assert!(again.get("interface_font").is_none(), "nothing chosen");
+        assert_eq!(again["interface_text_size"], 100);
+    }
+
+    /// #1489: the chosen font is saved as its path, not as the text `display()` makes of it,
+    /// which names another file when the path isn't Unicode on Windows (`serde` refuses such a
+    /// path rather than save that name, so the choice stays as made in memory); the test's path
+    /// is the one a person can have, with a space.
+    #[test]
+    fn the_chosen_font_is_saved_as_its_path() {
+        use super::Settings;
+        let s = Settings {
+            interface_font: Some(std::path::PathBuf::from(r"C:\Fonts\my font.ttf")),
+            ..Default::default()
+        };
+        let saved = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            saved["interface_font"],
+            serde_json::json!(r"C:\Fonts\my font.ttf")
+        );
+        let again: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(again.interface_font, s.interface_font);
+    }
+
+    /// #475: a folder chosen for a video is the Video category's next time; the category's own
+    /// folder stays "the default", following Downloads, and other categories stay as they were.
+    #[test]
+    fn a_folder_saved_into_becomes_the_categorys() {
+        use crate::model::Category;
+        let root = std::env::temp_dir();
+        let downloads = root.join("Downloads");
+        let downloads = downloads.as_path();
+        let mut s = super::Settings::default();
+        let default_video = s.category_dir(Category::Video, downloads);
+        assert!(!s.keep_category_dir(Category::Video, &default_video, downloads));
+        assert!(s.category_dirs.is_empty(), "the default stays the default");
+        assert!(!s.keep_category_dir(Category::Video, Path::new(""), downloads));
+        let chosen = root.join("clips");
+        let chosen = chosen.as_path();
+        assert!(s.keep_category_dir(Category::Video, chosen, downloads));
+        assert_eq!(s.category_dir(Category::Video, downloads), chosen);
+        assert_ne!(s.category_dir(Category::Music, downloads), chosen);
+        assert!(!s.keep_category_dir(Category::Video, chosen, downloads));
+    }
+
+    /// #1973: one folder for every download sends every category's new downloads to General's
+    /// folder (the user's own and Torrents too), and a folder remembered then is General's; off,
+    /// each category's folder is as before. Settings saved before it (no `one_folder`) read it
+    /// off, and a newer file's field is kept through a save.
+    #[test]
+    fn one_folder_sends_every_category_to_generals() {
+        use crate::model::Category;
+        let root = std::env::temp_dir().join("mdm-1973");
+        let downloads = root.join("Downloads");
+        let downloads = downloads.as_path();
+        let old: super::Settings = serde_json::from_value(serde_json::json!({
+            "category_dirs": [["General", root.join("All").display().to_string()]],
+        }))
+        .unwrap();
+        assert!(!old.one_folder, "off in settings saved before it");
+        let mut s = old.clone();
+        let general = root.join("All");
+        let cats = [
+            Category::Video,
+            Category::Music,
+            Category::Compressed,
+            Category::Torrents,
+            Category::General,
+        ];
+        for c in cats {
+            assert_eq!(
+                s.save_dir(c, downloads),
+                s.category_dir(c, downloads),
+                "{c:?}"
+            );
+        }
+        assert_ne!(s.save_dir(Category::Video, downloads), general);
+        s.one_folder = true;
+        for c in cats {
+            assert_eq!(s.save_dir(c, downloads), general, "{c:?}");
+            assert_eq!(s.folder_category(c), Category::General);
+        }
+        // Each category keeps its own folder for when it is off again.
+        assert_eq!(
+            s.category_dir(Category::Video, downloads),
+            general.join("Video")
+        );
+        // "Remember this path": General's folder is the one that changes.
+        let chosen = root.join("Elsewhere");
+        assert!(s.keep_save_dir(Category::Video, &chosen, downloads));
+        assert_eq!(s.save_dir(Category::Music, downloads), chosen);
+        assert_eq!(s.category_dir(Category::General, downloads), chosen);
+        assert!(
+            !s.category_dirs.iter().any(|(c, _)| c == "Video"),
+            "Video's own folder untouched: {:?}",
+            s.category_dirs
+        );
+        // Saved and read again (a newer version's file read by this one keeps the choice).
+        let again: super::Settings =
+            serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert!(again.one_folder);
+        s.one_folder = false;
+        assert_eq!(s.save_dir(Category::Video, downloads), chosen.join("Video"));
+    }
+
+    /// #1563: a list from 0.5.2 that remembered "Also delete the files from disk" ticked (and
+    /// the question turned off) loads as before otherwise, and its next save drops the tick.
+    #[test]
+    fn a_remembered_files_tick_is_dropped() {
+        let old: super::Settings = serde_json::from_value(serde_json::json!({
+            "confirm_delete": false,
+            "delete_files_too": true,
+            "max_connections": 3,
+        }))
+        .unwrap();
+        assert!(!old.confirm_delete);
+        assert_eq!(old.max_connections, 3, "the rest is read as before");
+        let saved = serde_json::to_value(&old).unwrap();
+        assert!(saved.get("delete_files_too").is_none(), "{saved}");
+        assert!(saved.get("confirm_delete").is_some());
+    }
+
+    /// #1365: a click on the tray icon shows the downloads panel in a new list, and keeps
+    /// opening the window in a list saved before the panel; the choice is kept across a save.
+    #[test]
+    fn the_tray_panel_is_on_for_new_lists_only() {
+        use super::Settings;
+        assert!(Settings::default().tray_panel, "a new list: the panel");
+        let old: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(
+            !old.tray_panel,
+            "a list saved before it: the window, as before"
+        );
+        for on in [true, false] {
+            let s = Settings {
+                tray_panel: on,
+                ..Settings::default()
+            };
+            let again: Settings =
+                serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+            assert_eq!(again.tray_panel, on);
+        }
+    }
+
+    /// #1773: pop-ups wait during a full-screen app, in a new list and in one saved before the
+    /// switch; turned off, it stays off across a save.
+    #[test]
+    fn pop_ups_wait_by_default_in_new_and_old_lists() {
+        use super::Settings;
+        assert!(Settings::default().hold_popups);
+        let old: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(old.hold_popups, "a list saved before it");
+        let off = Settings {
+            hold_popups: false,
+            ..Settings::default()
+        };
+        let again: Settings = serde_json::from_value(serde_json::to_value(&off).unwrap()).unwrap();
+        assert!(!again.hold_popups);
+    }
+
+    /// #1278: the video button's size is Automatic unless Full or Compact was chosen, kept across
+    /// a save, and read by the native host under the same names
+    /// (mdm_ipc::capture::CaptureRules).
+    #[test]
+    fn the_video_buttons_size_is_saved_and_read_by_the_host() {
+        use super::Settings;
+        let auto = Settings::default();
+        assert!(
+            !auto.video_panel_compact && !auto.video_panel_full,
+            "Automatic by default"
+        );
+        let old: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(
+            !old.video_panel_compact,
+            "settings saved before it: Automatic"
+        );
+        assert!(!old.video_panel_full, "settings saved before it: Automatic");
+        let before: Settings =
+            serde_json::from_value(serde_json::json!({ "video_panel_compact": true })).unwrap();
+        assert!(
+            before.video_panel_compact && !before.video_panel_full,
+            "Compact kept"
+        );
+        let full = Settings {
+            video_panel_full: true,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_value(&full).unwrap();
+        let again: Settings = serde_json::from_value(saved.clone()).unwrap();
+        assert!(again.video_panel_full);
+        let rules: mdm_ipc::capture::CaptureRules = serde_json::from_value(saved).unwrap();
+        assert!(rules.video_panel_full && !rules.video_panel_compact);
+        let s = Settings {
+            video_panel_compact: true,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_value(&s).unwrap();
+        let again: Settings = serde_json::from_value(saved.clone()).unwrap();
+        assert!(again.video_panel_compact);
+        let rules: mdm_ipc::capture::CaptureRules = serde_json::from_value(saved).unwrap();
+        assert!(rules.video_panel_compact);
+        let rules: mdm_ipc::capture::CaptureRules =
+            serde_json::from_value(serde_json::to_value(Settings::default()).unwrap()).unwrap();
+        assert!(!rules.video_panel_compact);
+        assert_eq!(auto.video_panel_scale, 100, "100% scale by default");
+        assert_eq!(
+            old.video_panel_scale, 100,
+            "settings saved before #1923: 100%"
+        );
+        assert_eq!(rules.video_panel_scale, 100);
+        for scale in [80, 120] {
+            let scaled = Settings {
+                video_panel_scale: scale,
+                ..Settings::default()
+            };
+            let saved = serde_json::to_value(&scaled).unwrap();
+            let again: Settings = serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(again.video_panel_scale, scale);
+            let rules: mdm_ipc::capture::CaptureRules = serde_json::from_value(saved).unwrap();
+            assert_eq!(rules.video_panel_scale, scale);
+        }
+        assert_eq!(mdm_ipc::capture::clean_video_panel_scale(0), 100);
+        assert_eq!(mdm_ipc::capture::clean_video_panel_scale(999), 100);
+    }
+
+    #[test]
+    fn a_dialog_keeps_what_changed_elsewhere_meanwhile() {
+        let from = super::Settings::default();
+        let mut live = from.clone();
+        live.speed_limit_on = !from.speed_limit_on; // the toolbar, while Options was open
+        let mut to = from.clone();
+        to.max_connections = 3; // Options
+        let out = super::Settings::merge_changes(&live, &from, &to);
+        assert_eq!(out.speed_limit_on, live.speed_limit_on);
+        assert_eq!(out.max_connections, 3);
+    }
+
+    use super::*;
+
+    /// #40: torrents use only a manual SOCKS5 proxy, with its login; asked for one and given
+    /// none, they don't start (no config) rather than go around it.
+    #[test]
+    fn torrents_use_a_socks5_proxy_or_none() {
+        let dir = std::path::PathBuf::from("state");
+        let mut s = Settings {
+            proxy_mode: 3,
+            proxy_host: "socks5://127.0.0.1".into(),
+            proxy_port: "1080".into(),
+            proxy_user: "ann".into(),
+            proxy_pass: "p@ss".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.socks5_proxy().as_deref(),
+            Some("socks5://ann:p%40ss@127.0.0.1:1080")
+        );
+        assert_eq!(
+            s.torrent_config(dir.clone()).unwrap().proxy,
+            None,
+            "not asked"
+        );
+        s.torrent_proxy = true;
+        assert!(s.torrent_config(dir.clone()).unwrap().proxy.is_some());
+        s.proxy_host = "http://127.0.0.1".into();
+        assert_eq!(s.socks5_proxy(), None, "an HTTP proxy isn't for torrents");
+        // #1558: Type SOCKS5 with the address alone; socks5h unless names are looked up here.
+        s.proxy_host = "127.0.0.1".into();
+        s.proxy_kind = ProxyKind::Socks5;
+        assert_eq!(
+            s.socks5_proxy().as_deref(),
+            Some("socks5h://ann:p%40ss@127.0.0.1:1080")
+        );
+        s.proxy_kind = ProxyKind::Socks4;
+        assert_eq!(s.socks5_proxy(), None, "librqbit takes SOCKS5 only");
+        s.proxy_host = "http://127.0.0.1".into();
+        assert!(
+            s.torrent_config(dir.clone()).is_none(),
+            "asked, none there: not started"
+        );
+        s.torrent_port = 51413;
+        s.torrent_proxy = false;
+        let c = s.torrent_config(dir).unwrap();
+        assert_eq!(
+            (c.port, c.listen, c.dht, c.lsd),
+            (Some(51413), true, true, true)
+        );
+    }
+
+    /// #1058: the browser integration (the native host, mdm_ipc::capture::CaptureRules) reads
+    /// the capture settings from the saved list by the app's own names: Torrent settings' switch
+    /// too, as settled; not decided yet, it takes torrents, as before.
+    #[test]
+    fn the_host_reads_the_capture_settings_as_saved() {
+        use mdm_ipc::capture::CaptureRules;
+        let read = |s: &Settings| -> CaptureRules {
+            serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap()
+        };
+        let d = Settings::default();
+        let r = read(&d);
+        assert_eq!((d.torrent_associations, r.torrent_handler), (None, None));
+        assert!(r.takes_torrents());
+        assert_eq!(r.auto_types, d.auto_types);
+        assert_eq!(r.capture_min_kb, d.capture_min_kb);
+        for on in [false, true] {
+            let s = Settings {
+                torrent_associations: Some(on),
+                capture_min_kb: 7,
+                ..Settings::default()
+            };
+            let r = read(&s);
+            assert_eq!(r.torrent_handler, Some(on));
+            assert_eq!(r.takes_torrents(), on);
+            assert_eq!(r.capture_min_kb, 7);
+        }
+    }
+
+    /// #1581: private-window downloads are kept in the list by default, for a new list and for
+    /// every list that never chose (before #1581 the unticked default was saved as
+    /// `keep_private_downloads: false`, which says nothing); a choice saved since is kept.
+    #[test]
+    fn private_window_downloads_are_kept_unless_the_user_unticked_it() {
+        let read = |json: serde_json::Value| serde_json::from_value::<Settings>(json).unwrap();
+        assert!(Settings::default().keep_private_downloads, "on by default");
+        assert!(!Settings::default().private_notice_shown);
+        // A list from 0.5.2 or before (no such key) and one from a build between #1364 and
+        // #1581 (its saved default): on.
+        assert!(read(serde_json::json!({})).keep_private_downloads);
+        assert!(read(serde_json::json!({"keep_private_downloads": false})).keep_private_downloads);
+        assert!(read(serde_json::json!({"keep_private_downloads": true})).keep_private_downloads);
+        // Unticked (or ticked) since: as chosen, through a save and a read again.
+        for on in [false, true] {
+            let s = Settings {
+                keep_private_downloads: on,
+                ..Settings::default()
+            };
+            let saved = serde_json::to_value(&s).unwrap();
+            assert_eq!(saved["keep_private_list"], on);
+            assert!(saved.get("keep_private_downloads").is_none());
+            assert_eq!(read(saved).keep_private_downloads, on);
+            // Even beside the old key an earlier build left in the file.
+            let both = serde_json::json!({"keep_private_list": on, "keep_private_downloads": !on});
+            assert_eq!(read(both).keep_private_downloads, on);
+        }
+        // The notice's flag is kept once set.
+        let s = Settings {
+            private_notice_shown: true,
+            ..Settings::default()
+        };
+        assert!(read(serde_json::to_value(&s).unwrap()).private_notice_shown);
+    }
+
+    /// #1058: Torrent settings' switch is settled once, as the user chose it.
+    #[test]
+    fn the_torrent_switch_is_settled_once_as_chosen() {
+        let undecided = Settings::default;
+        let settle = |mut s: Settings, installer: Option<bool>, registered: bool| {
+            let changed = s.settle_torrent_handler(installer, || registered);
+            (s.torrent_associations, changed)
+        };
+        // Never decided: MDM opens .torrent files now (the installer's task, an earlier tick,
+        // an all-users association) → on; it doesn't → off.
+        assert_eq!(settle(undecided(), None, true), (Some(true), true));
+        assert_eq!(settle(undecided(), None, false), (Some(false), true));
+        // The installer's value wins over what the system says.
+        assert_eq!(settle(undecided(), Some(false), true), (Some(false), true));
+        assert_eq!(settle(undecided(), Some(true), false), (Some(true), true));
+        // An earlier version's tick stays.
+        let ticked = Settings {
+            torrent_associations_before: true,
+            ..Settings::default()
+        };
+        assert_eq!(settle(ticked, Some(false), false), (Some(true), true));
+        // Decided: kept, whatever the system says (an everyone's association, HKLM, that
+        // unticking couldn't remove), and the system isn't asked.
+        for on in [false, true] {
+            let mut s = Settings {
+                torrent_associations: Some(on),
+                ..Settings::default()
+            };
+            assert!(!s.settle_torrent_handler(Some(!on), || panic!("asked")));
+            assert_eq!(s.torrent_associations, Some(on));
+        }
+        // A list saved before #1058: its false is undecided, its true ticked.
+        let old: Settings = serde_json::from_str(r#"{"torrent_associations":false}"#).unwrap();
+        assert_eq!(
+            (old.torrent_associations, old.torrent_associations_before),
+            (None, false)
+        );
+        let old: Settings = serde_json::from_str(r#"{"torrent_associations":true}"#).unwrap();
+        assert_eq!(
+            (old.torrent_associations, old.torrent_associations_before),
+            (None, true)
+        );
+        // Settled and saved, it reads back decided: no second settling.
+        let mut s = old;
+        s.settle_torrent_handler(None, || false);
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["torrent_handler"], serde_json::json!(true));
+        assert!(json.get("torrent_associations").is_none(), "{json}");
+        let mut back: Settings = serde_json::from_value(json).unwrap();
+        assert!(!back.settle_torrent_handler(Some(false), || false));
+        assert_eq!(back.torrent_associations, Some(true));
+    }
+
+    /// #41: a list saved before Zen was known gets it, captured; a choice made is kept.
+    #[test]
+    fn saved_browser_lists_get_new_browsers() {
+        let mut s = Settings {
+            browsers: vec![("Google Chrome".into(), false)],
+            ..Settings::default()
+        };
+        s.list_known_browsers();
+        assert_eq!(s.browsers[0], ("Google Chrome".into(), false));
+        assert!(s.browsers.contains(&("Zen Browser".into(), true)));
+        assert_eq!(s.browsers.len(), BROWSERS.len());
+        s.list_known_browsers();
+        assert_eq!(s.browsers.len(), BROWSERS.len(), "each once");
+    }
+
+    #[test]
+    fn history_keeps_each_entry_once_newest_first() {
+        let mut h = Vec::new();
+        for v in ["a", "b", "a", "  ", "c"] {
+            remember(&mut h, v);
+        }
+        assert_eq!(h, ["c", "a", "b"]);
+        for i in 0..30 {
+            remember(&mut h, &i.to_string());
+        }
+        assert_eq!(h.len(), HISTORY);
+        assert_eq!(h[0], "29");
+    }
+
+    #[test]
+    fn site_logins_match_by_host_and_path() {
+        let s = Settings {
+            site_logins: vec![
+                ("files.example.com/private".into(), "a".into(), "1".into()),
+                ("*.corp.net".into(), "b".into(), "2".into()),
+            ],
+            ..Settings::default()
+        };
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/private/x.zip")),
+            Some(("a".into(), "1".into()))
+        );
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/public/x.zip")),
+            None
+        );
+        assert_eq!(
+            s.site_login(&url("http://dl.corp.net/y")),
+            Some(("b".into(), "2".into()))
+        );
+        // Whole path segments only.
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/private-backup/x.zip")),
+            None
+        );
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/privatedocs/x.zip")),
+            None
+        );
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/private")),
+            Some(("a".into(), "1".into())),
+            "the path itself"
+        );
+        // The most specific entry wins, wherever it sits in the list.
+        let s = Settings {
+            site_logins: vec![
+                ("files.example.com".into(), "c".into(), "3".into()),
+                ("files.example.com/private".into(), "a".into(), "1".into()),
+            ],
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/private/x.zip")),
+            Some(("a".into(), "1".into())),
+            "the longest match"
+        );
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/other/x.zip")),
+            Some(("c".into(), "3".into())),
+            "the host alone, for the rest"
+        );
+        // As long as each other: the first in the list, as before.
+        let s = Settings {
+            site_logins: vec![
+                ("files.example.com/private".into(), "a".into(), "1".into()),
+                ("files.example.com/private/".into(), "d".into(), "4".into()),
+                ("*.example.com".into(), "e".into(), "5".into()),
+                ("files.example.com".into(), "c".into(), "3".into()),
+            ],
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/private/x.zip")),
+            Some(("a".into(), "1".into())),
+            "the first of two equal paths"
+        );
+        assert_eq!(
+            s.site_login(&url("https://files.example.com/other/x.zip")),
+            Some(("e".into(), "5".into())),
+            "the first of two hosts alone"
+        );
+    }
+
+    #[test]
+    fn listed_file_types() {
+        let s = Settings::default();
+        let listed = |name| mdm_ipc::capture::type_listed(&s.auto_types, name);
+        assert!(listed("setup.EXE") && listed("a.r01") && listed("x.zip"));
+        assert!(!listed("page.html") && !listed("noext"));
+    }
+
+    #[test]
+    fn the_persons_ytdlp_config_is_off_until_chosen() {
+        let old: Settings = serde_json::from_str(r#"{"video_chapters":true}"#).unwrap();
+        assert!(!old.ytdlp_config);
+        assert!(!Settings::default().ytdlp_config);
+    }
+
+    /// #1556: the command line gets the app's proxy, DNS, adapter and torrent proxy, as the
+    /// settings give them to the app's downloads.
+    #[test]
+    fn the_command_line_gets_the_apps_network() {
+        let mut s = Settings {
+            proxy_from_browser: false,
+            proxy_mode: 3,
+            proxy_host: "socks5://127.0.0.1".into(),
+            proxy_port: "1080".into(),
+            net_adapter: " wg0 ".into(),
+            dns_mode: 2,
+            dns_provider: "quad9".into(),
+            ..Settings::default()
+        };
+        let net = s.cli_net();
+        assert_eq!(net.proxy, s.proxy());
+        assert_eq!(net.dns, s.dns());
+        assert_eq!(net.adapter, "wg0");
+        assert_eq!(net.torrent_proxy, mdm_cli::TorrentProxy::Off);
+        s.torrent_proxy = true;
+        assert_eq!(
+            s.cli_net().torrent_proxy,
+            mdm_cli::TorrentProxy::Through("socks5://127.0.0.1:1080".into())
+        );
+        s.proxy_host = "http://127.0.0.1".into();
+        assert_eq!(s.cli_net().torrent_proxy, mdm_cli::TorrentProxy::Missing);
+        // No settings yet: the system's proxy, as the app has it.
+        assert_eq!(
+            Settings::default().cli_net().proxy,
+            mdm_engine::Proxy::System
+        );
+    }
+
+    /// #1558: Manual's Type gives the address its scheme; a SOCKS proxy carries http and https
+    /// whatever the boxes say, SOCKS4 has no login; an address typed the old way
+    /// (`socks5://host`) still says SOCKS5, with the names looked up here as then.
+    #[test]
+    fn a_manual_proxy_of_each_type() {
+        let mut s = Settings {
+            proxy_from_browser: false,
+            proxy_mode: 3,
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: "1080".into(),
+            proxy_user: "ann".into(),
+            proxy_pass: "pw".into(),
+            proxy_kind: ProxyKind::Socks5,
+            ..Settings::default()
+        };
+        assert!(s.proxy_remote_dns, "on by default");
+        let manual = |s: &Settings| match s.proxy() {
+            mdm_engine::Proxy::Manual {
+                url,
+                login,
+                http,
+                https,
+            } => (url, login.is_some(), http, https),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            manual(&s),
+            ("socks5h://127.0.0.1:1080".into(), true, true, true)
+        );
+        s.proxy_remote_dns = false;
+        assert_eq!(manual(&s).0, "socks5://127.0.0.1:1080");
+        s.proxy_kind = ProxyKind::Socks4;
+        assert_eq!(
+            manual(&s),
+            ("socks4://127.0.0.1:1080".into(), false, true, true)
+        );
+        s.proxy_remote_dns = true;
+        assert_eq!(manual(&s).0, "socks4a://127.0.0.1:1080");
+        s.proxy_kind = ProxyKind::Https;
+        s.proxy_https = true;
+        assert_eq!(
+            manual(&s),
+            ("https://127.0.0.1:1080".into(), true, false, true)
+        );
+        s.proxy_kind = ProxyKind::Http;
+        assert_eq!(manual(&s).0, "http://127.0.0.1:1080");
+        // The old way: the scheme in the address wins over Type.
+        s.proxy_host = "socks5://10.0.0.2".into();
+        assert_eq!(
+            s.manual_proxy(),
+            Some((ProxyKind::Socks5, false, "10.0.0.2:1080".into()))
+        );
+        assert_eq!(
+            manual(&s),
+            ("socks5://10.0.0.2:1080".into(), true, true, true)
+        );
+        s.proxy_host = "SOCKS5H://10.0.0.2/".into();
+        assert_eq!(manual(&s).0, "socks5h://10.0.0.2:1080");
+        // A settings file from before Type: HTTP, names through the proxy.
+        let old: Settings =
+            serde_json::from_str(r#"{"proxy_mode": 3, "proxy_host": "10.0.0.1"}"#).unwrap();
+        assert_eq!(
+            (old.proxy_kind, old.proxy_remote_dns),
+            (ProxyKind::Http, true)
+        );
+        // Saved and read back.
+        let back: Settings = serde_json::from_str(
+            &serde_json::to_string(&Settings {
+                proxy_kind: ProxyKind::Socks4,
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.proxy_kind, ProxyKind::Socks4);
+        // No address: no manual proxy, the browser's or none.
+        s.proxy_host = " ".into();
+        assert_eq!(s.proxy(), mdm_engine::Proxy::None);
+    }
+
+    /// #1558: Get System reads Windows' `ProxyServer`: one proxy for everything, per-scheme
+    /// ones (the HTTP one, ticked for the schemes it serves), or only a SOCKS one.
+    #[test]
+    fn get_system_reads_windows_proxy_server() {
+        let got =
+            |v: &str| parse_system_proxy(v).map(|p| (p.kind, p.host, p.port, p.http, p.https));
+        let http = |h: &str, p: &str, a, b| Some((ProxyKind::Http, h.into(), p.into(), a, b));
+        assert_eq!(got("127.0.0.1:7890"), http("127.0.0.1", "7890", true, true));
+        assert_eq!(
+            got("http=proxy.corp:8080;https=proxy.corp:8080;socks=s.corp:1080"),
+            http("proxy.corp", "8080", true, true)
+        );
+        assert_eq!(
+            got("http=a:1;https=b:2"),
+            http("a", "1", true, false),
+            "only the schemes this proxy serves"
+        );
+        assert_eq!(got("https=b:2"), http("b", "2", false, true));
+        assert_eq!(
+            got("socks=127.0.0.1:1080"),
+            Some((
+                ProxyKind::Socks5,
+                "127.0.0.1".into(),
+                "1080".into(),
+                true,
+                true
+            ))
+        );
+        assert_eq!(
+            got(" SOCKS=localhost:9050 ; ftp=f:21"),
+            Some((
+                ProxyKind::Socks5,
+                "localhost".into(),
+                "9050".into(),
+                true,
+                true
+            ))
+        );
+        assert_eq!(got("http=http://p:3128/"), http("p", "3128", true, false));
+        assert_eq!(got("ftp=f:21"), None);
+        assert_eq!(got(""), None);
+    }
+
+    /// #1778: site rules round-trip through the settings file, an older file has none, and the
+    /// exceptions match the same way: `*` any text, the first match winning.
+    #[test]
+    fn site_rules_and_exceptions() {
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        let s = Settings {
+            conn_exceptions: vec![("*.example.test".into(), 4), ("dl.example.test".into(), 2)],
+            site_rules: vec![mdm_ipc::siterules::SiteRule {
+                site: "*.example.test".into(),
+                user_agent: "Rule/1".into(),
+                browser_like: true,
+                headers: vec![("X-A".into(), "1".into())],
+            }],
+            ..Settings::default()
+        };
+        assert_eq!(s.connections_for(&url("https://dl.example.test/f")), 4);
+        assert_eq!(s.connections_for(&url("https://example.test/f")), 8);
+        let got = s.site_settings(&url("https://dl.example.test/f"));
+        assert_eq!(got.user_agent.as_deref(), Some("Rule/1"));
+        assert!(got.browser_like);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.site_rules, s.site_rules);
+        let old: Settings =
+            serde_json::from_str(r#"{"conn_exceptions": [["ftp.slow.org", 1]]}"#).unwrap();
+        assert!(old.site_rules.is_empty());
+        assert_eq!(old.connections_for(&url("ftp://ftp.slow.org/a")), 1);
+    }
+
+    #[test]
+    fn connection_exceptions_and_proxy() {
+        let mut s = Settings {
+            conn_exceptions: vec![("ftp.slow.org".into(), 1)],
+            ..Settings::default()
+        };
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        assert_eq!(s.connections_for(&url("ftp://ftp.slow.org/a")), 1);
+        assert_eq!(s.connections_for(&url("https://fast.org/a")), 8);
+        // Beyond 32 only once allowed (issue #12), and never beyond 128.
+        s.max_connections = 100;
+        s.conn_exceptions.push(("big.org".into(), 500));
+        assert_eq!(s.connections_for(&url("https://fast.org/a")), 32);
+        assert_eq!(s.connections_for(&url("https://big.org/a")), 32);
+        s.many_connections = true;
+        assert_eq!(s.connections_for(&url("https://fast.org/a")), 100);
+        assert_eq!(s.connections_for(&url("https://big.org/a")), 128);
+        // An older settings file has no switch: locked.
+        let old: Settings = serde_json::from_str(r#"{"max_connections": 64}"#).unwrap();
+        assert!(!old.many_connections);
+        // Nor cookies for video sites (#229): off.
+        assert_eq!(old.video_cookies(), None);
+        assert_eq!(Settings::default().video_cookies(), None);
+        assert_eq!(old.connections_for(&url("https://fast.org/a")), 32);
+        // IDM's default: no proxy, but "use the browser's proxy" ticked — the browser's is
+        // Windows' (none set there: direct).
+        assert_eq!(s.proxy(), mdm_engine::Proxy::System);
+        // #1448: the system's settings are followed, its automatic configuration script too.
+        assert!(s.follows_system());
+        s.proxy_from_browser = false;
+        assert_eq!(s.proxy(), mdm_engine::Proxy::None);
+        assert!(!s.follows_system());
+        s.proxy_mode = 1;
+        assert!(s.follows_system());
+        s.proxy_mode = 2;
+        assert!(!s.follows_system());
+        s.proxy_mode = 3;
+        s.proxy_host = "10.0.0.1".into();
+        s.proxy_port = "3128".into();
+        s.proxy_https = true;
+        assert!(matches!(
+            s.proxy(),
+            mdm_engine::Proxy::Manual { ref url, https: true, http: false, .. }
+                if url == "http://10.0.0.1:3128"
+        ));
+        assert!(!s.follows_system());
+    }
+}
+
+/// Sites Logins' passwords on disk: in the system's keychain once it holds them (secrets.rs),
+/// else sealed as `sealed` seals them. A list from before reads as before, and a password that
+/// can't be opened (the list copied to another account) reads as none.
+mod sealed_logins {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::sealed::{open, seal};
+
+    pub fn serialize<S: Serializer>(
+        v: &[(String, String, String)],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        if crate::secrets::is_prepared() {
+            return v.serialize(s);
+        }
+        v.iter()
+            .map(|(site, user, pw)| (site, user, seal(pw)))
+            .collect::<Vec<_>>()
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<(String, String, String)>, D::Error> {
+        let v = Vec::<(String, String, String)>::deserialize(d)?;
+        Ok(v.into_iter()
+            .map(|(site, user, pw)| (site, user, open(&pw)))
+            .collect())
+    }
+}
+
+/// One secret on disk (the proxy's password, a debrid account's credential, #44). In the
+/// system's keychain once it holds it: the settings then keep its reference (secrets.rs,
+/// `keychain:…`, written by [`Settings::for_disk`]). Until then, and where no keychain is used:
+/// Windows seals it with DPAPI, for this account on this computer; Linux and macOS keep it as it
+/// is, in the data folder only its owner may read (mdm_ipc::private_dir). A secret that can't be
+/// opened (the file copied to another account) reads as none: sign in again.
+pub(crate) mod sealed {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::secrets::REF;
+
+    #[cfg(windows)]
+    const SEALED: &str = "dpapi:";
+    /// Before a secret kept as it is that would read as a reference (`keychain:…`), or as one
+    /// of these.
+    const PLAIN: &str = "plain:";
+
+    pub fn serialize<S: Serializer>(v: &str, s: S) -> Result<S::Ok, S::Error> {
+        if crate::secrets::is_prepared() {
+            return s.serialize_str(v);
+        }
+        s.serialize_str(&seal(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        Ok(open(&String::deserialize(d)?))
+    }
+
+    pub(crate) fn seal(pw: &str) -> String {
+        #[cfg(windows)]
+        if !pw.is_empty()
+            && let Some(sealed) = crate::win32::protect(pw)
+        {
+            use base64::Engine as _;
+            return format!(
+                "{SEALED}{}",
+                base64::engine::general_purpose::STANDARD.encode(sealed)
+            );
+        }
+        if pw.starts_with(REF) || escaped(pw).is_some() {
+            return format!("{PLAIN}{pw}");
+        }
+        pw.to_owned()
+    }
+
+    /// What `seal` escaped: `plain:` before a reference or another `plain:` (a plain secret from
+    /// before that starts with `plain:` alone reads as it is).
+    fn escaped(stored: &str) -> Option<&str> {
+        stored
+            .strip_prefix(PLAIN)
+            .filter(|rest| rest.starts_with(REF) || rest.starts_with(PLAIN))
+    }
+
+    pub(crate) fn open(stored: &str) -> String {
+        // Read as the disk has it (store::keep_generations only checks that a list reads).
+        if crate::secrets::is_prepared() {
+            return stored.to_owned();
+        }
+        if stored.starts_with(REF) {
+            return crate::secrets::vault().open(stored);
+        }
+        if let Some(plain) = escaped(stored) {
+            return plain.to_owned();
+        }
+        #[cfg(windows)]
+        if let Some(b64) = stored.strip_prefix(SEALED) {
+            use base64::Engine as _;
+            return base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .ok()
+                .and_then(|b| crate::win32::unprotect(&b))
+                .unwrap_or_default();
+        }
+        stored.to_owned()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn the_proxy_password_and_debrid_secrets_are_sealed_on_disk() {
+            let s = crate::settings::Settings {
+                proxy_pass: "proxy-s3cret".into(),
+                archive_passwords: "zip-s3cret\nother".into(),
+                debrid_accounts: vec![crate::settings::DebridAccount {
+                    id: 1,
+                    user: "me".into(),
+                    secret: r#"{"kind":"token","token":"rd-s3cret"}"#.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            if cfg!(windows) {
+                assert!(
+                    !json.contains("proxy-s3cret")
+                        && !json.contains("rd-s3cret")
+                        && !json.contains("zip-s3cret")
+                );
+            }
+            let back: crate::settings::Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.proxy_pass, "proxy-s3cret");
+            assert_eq!(back.archive_password_list(), vec!["zip-s3cret", "other"]);
+            assert!(back.debrid_accounts[0].account().is_some());
+            // Never in a debug dump either.
+            assert!(!format!("{:?}", back.debrid_accounts).contains("rd-s3cret"));
+            // A plain password from before still reads; a secret sealed elsewhere reads as none
+            // (signed out).
+            let old: crate::settings::Settings =
+                serde_json::from_value(serde_json::json!({ "proxy_pass": "plain" })).unwrap();
+            assert_eq!(old.proxy_pass, "plain");
+            if cfg!(windows) {
+                let foreign =
+                    serde_json::json!({ "debrid_accounts": [{ "id": 2, "secret": "dpapi:AAAA" }] });
+                let s: crate::settings::Settings = serde_json::from_value(foreign).unwrap();
+                assert!(s.debrid_accounts[0].account().is_none());
+            }
+        }
+
+        #[test]
+        fn passwords_are_sealed_on_disk_and_read_back() {
+            let s = crate::settings::Settings {
+                site_logins: vec![("example.com".into(), "me".into(), "s3cret".into())],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            if cfg!(windows) {
+                assert!(!json.contains("s3cret") && json.contains("dpapi:"));
+            }
+            let back: crate::settings::Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.site_logins, s.site_logins);
+            // A list from before (plain) still reads.
+            let plain = serde_json::json!({ "site_logins": [["a.test", "u", "pw"]] });
+            let old: crate::settings::Settings = serde_json::from_value(plain).unwrap();
+            assert_eq!(old.site_logins[0].2, "pw");
+        }
+
+        #[test]
+        fn the_close_button_keeps_mdm_running_unless_told_otherwise() {
+            let s: crate::settings::Settings =
+                serde_json::from_value(serde_json::json!({})).unwrap();
+            assert!(
+                s.close_to_tray,
+                "a list from before the option goes on hiding"
+            );
+            let s: crate::settings::Settings =
+                serde_json::from_value(serde_json::json!({ "close_to_tray": false })).unwrap();
+            assert!(!s.close_to_tray);
+        }
+    }
+}
